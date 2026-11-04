@@ -1,0 +1,48 @@
+name: Build installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            args: --target universal-apple-darwin --bundles app,dmg
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+            bundle_dir: app/src-tauri/target/universal-apple-darwin/release/bundle
+          - os: windows-latest
+            args: --bundles nsis,msi
+            rust_targets: x86_64-pc-windows-msvc
+            bundle_dir: app/src-tauri/target/release/bundle
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: app/src-tauri
+      - run: npm ci
+      - run: npm run tauri build -- ${{ matrix.args }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipet-${{ matrix.os }}
+          path: |
+            ${{ matrix.bundle_dir }}/dmg/*.dmg
+            ${{ matrix.bundle_dir }}/nsis/*.exe
+            ${{ matrix.bundle_dir }}/msi/*.msi
+          if-no-files-found: error

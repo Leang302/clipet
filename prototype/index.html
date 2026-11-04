@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ClipFlow — UX Prototype</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<div id="desktop">
+
+  <!-- Fake background apps, purely to give the popup something to float over -->
+  <div class="fake-window notes">
+    <div class="titlebar"><div class="dot red"></div><div class="dot yellow"></div><div class="dot green"></div><div class="titlebar-label">Notes</div></div>
+    <div class="content">Q3 planning notes…<br><br>— Follow up with design on the onboarding flow<br>— Ship the v2 pricing page by Friday<br>— Ask Sam about the API rate limits</div>
+  </div>
+  <div class="fake-window browser">
+    <div class="titlebar"><div class="dot red"></div><div class="dot yellow"></div><div class="dot green"></div><div class="titlebar-label">Browser — docs.example.com</div></div>
+    <div class="content">This window simulates whatever app was focused before ClipFlow opened — it's where "Paste to …" and pasted content would land.</div>
+  </div>
+
+  <!-- Control strip: NOT part of the product. These buttons simulate OS-level events (pressing a global hotkey, the OS clipboard changing, taking a screenshot) since a browser can't do those for real. -->
+  <div id="control-strip">
+    <span class="label">Simulate:</span>
+    <button id="sim-copy-text">Copy text</button>
+    <button id="sim-copy-code">Copy code</button>
+    <button id="sim-copy-link">Copy link</button>
+    <button id="sim-copy-file">Copy file</button>
+    <div class="divider"></div>
+    <button id="sim-shot-region">Screenshot: Region</button>
+    <button id="sim-shot-full">Screenshot: Full screen</button>
+    <div class="divider"></div>
+    <button id="toggle-theme">Toggle theme</button>
+    <span class="spacer"></span>
+    <span class="hint">This strip is a test harness, not product UI. Real shortcuts: ⌘/Ctrl+Shift+V opens history.</span>
+  </div>
+
+  <!-- Onboarding -->
+  <div id="onboard-banner">
+    <h4>Try the three core workflows</h4>
+    <ol>
+      <li><b>Clipboard history:</b> click a "Simulate: Copy…" button, then press <b>⌘/Ctrl+Shift+V</b>.</li>
+      <li><b>Screenshot annotation:</b> click "Screenshot: Region", then click its thumbnail.</li>
+      <li><b>Multi-select paste:</b> take 2–3 screenshots, open history, filter Images, select several (Shift/Ctrl‑click), press <b>Shift+Enter</b>.</li>
+    </ol>
+    <button id="dismiss-onboard">Got it</button>
+  </div>
+
+  <!-- Tray / menu bar icon -->
+  <div id="tray-icon" title="ClipFlow is running in the background">📋</div>
+  <div id="tray-menu">
+    <div class="item" id="tray-open-history"><span>Open Clipboard History</span><span class="shortcut">⌘⇧V</span></div>
+    <div class="item" id="tray-capture"><span>Capture Screenshot</span><span class="shortcut">⌘⇧4</span></div>
+    <div class="sep"></div>
+    <div class="item" id="tray-pause"><span id="tray-pause-label">Pause Monitoring</span></div>
+    <div class="item" id="tray-settings"><span>Settings…</span></div>
+    <div class="item" id="tray-storage"><span>Storage Usage</span><span class="shortcut" id="tray-storage-val">—</span></div>
+    <div class="sep"></div>
+    <div class="item" id="tray-quit"><span>Quit ClipFlow</span></div>
+  </div>
+
+  <!-- Clipboard popup -->
+  <div id="popup-overlay">
+    <div id="clip-popup">
+      <div class="popup-body">
+        <div id="sidebar"></div>
+        <div id="list-panel">
+          <div id="search-row">
+            <input id="search-input" type="text" placeholder="Search clipboard history…" />
+            <select id="sort-select">
+              <option value="newest">Newest</option>
+              <option value="oldest">Oldest</option>
+              <option value="frequent">Most used</option>
+              <option value="favorites">Favorites first</option>
+            </select>
+          </div>
+          <div id="item-list"></div>
+        </div>
+        <div id="preview-panel">
+          <div id="preview-header">
+            <span id="preview-header-label">No selection</span>
+            <span id="preview-count-badge" style="display:none"></span>
+          </div>
+          <div id="preview-body"><div id="preview-empty">Select an item to preview it here.</div></div>
+        </div>
+      </div>
+      <div id="toolbar">
+        <span><span class="hint-key">↑↓</span>Navigate</span>
+        <span><span class="hint-key">Shift</span>Range</span>
+        <span><span class="hint-key">⌘/Ctrl</span>Toggle</span>
+        <span><span class="hint-key">Enter</span>Paste</span>
+        <span><span class="hint-key">Shift+Enter</span>Paste all</span>
+        <span><span class="hint-key">Esc</span>Close</span>
+        <span class="spacer"></span>
+        <span id="toolbar-dest"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- Screenshot floating notifications -->
+  <div id="screenshot-notifs"></div>
+
+  <!-- Annotation editor -->
+  <div id="editor-overlay">
+    <div id="editor-shell">
+      <div id="editor-topbar">
+        <span class="title" id="editor-title">Annotate Screenshot</span>
+        <span class="spacer"></span>
+        <button class="ghost" id="editor-cancel">Cancel</button>
+        <button class="primary" id="editor-done">Done</button>
+      </div>
+      <div id="editor-main">
+        <div id="editor-tools"></div>
+        <div id="editor-canvas-wrap">
+          <canvas id="editor-canvas" width="640" height="400"></canvas>
+        </div>
+        <div id="editor-sidebar">
+          <label>Color</label>
+          <input type="color" id="tool-color" value="#ff3b30" />
+          <label>Thickness <span id="thickness-val">4</span>px</label>
+          <input type="range" id="tool-thickness" min="1" max="30" value="4" />
+          <label>Font size <span id="fontsize-val">18</span>px</label>
+          <input type="range" id="tool-fontsize" min="10" max="48" value="18" />
+          <label style="margin-top:16px;">History</label>
+          <button class="ghost" id="tool-undo" style="width:100%;margin-bottom:6px;">Undo</button>
+          <button class="ghost" id="tool-redo" style="width:100%;">Redo</button>
+        </div>
+      </div>
+      <div id="editor-batch-strip" style="display:none"></div>
+    </div>
+  </div>
+
+  <!-- Settings window -->
+  <div id="settings-overlay">
+    <div id="settings-window" style="position:relative;">
+      <button id="settings-close">✕</button>
+      <div id="settings-tabs"></div>
+      <div id="settings-content"></div>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

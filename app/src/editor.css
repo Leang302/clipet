@@ -1,0 +1,67 @@
+:root {
+  --bg-panel: #ffffff;
+  --bg-panel-alt: #f4f5f7;
+  --bg-hover: #eef1f5;
+  --text-main: #1b1f24;
+  --text-muted: #6b7280;
+  --border: #e2e5ea;
+  --border-strong: #c9ced6;
+  --accent: #3b6fff;
+  --accent-soft: #e4ecff;
+  --warn: #c77d00;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg-panel: #1e2127; --bg-panel-alt: #262a32; --bg-hover: #2b2f38;
+    --text-main: #e7e9ee; --text-muted: #9aa1ab; --border: #30343d;
+    --border-strong: #3c414c; --accent: #4c7dff; --accent-soft: #233253;
+  }
+}
+/* Manual override (independent of the OS setting) — see src/theme.ts */
+:root[data-theme="dark"] {
+  --bg-panel: #1e2127; --bg-panel-alt: #262a32; --bg-hover: #2b2f38;
+  --text-main: #e7e9ee; --text-muted: #9aa1ab; --border: #30343d;
+  --border-strong: #3c414c; --accent: #4c7dff; --accent-soft: #233253;
+}
+
+* { box-sizing: border-box; }
+html[data-window="editor"], html[data-window="editor"] body, html[data-window="editor"] #root { margin: 0; padding: 0; height: 100%; }
+html[data-window="editor"] body { font-family: -apple-system, "Segoe UI", sans-serif; color: var(--text-main); background: var(--bg-panel); overflow: hidden; }
+
+#editor-shell { display: flex; flex-direction: column; height: 100vh; }
+#editor-topbar { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--border); background: var(--bg-panel-alt); flex-shrink: 0; }
+#editor-topbar .title { font-size: 13px; font-weight: 600; }
+#editor-topbar .spacer { flex: 1; }
+#editor-topbar button.primary { background: var(--accent); color: #fff; border: none; border-radius: 7px; padding: 7px 14px; font-size: 12.5px; cursor: pointer; font-weight: 600; }
+#editor-topbar button.ghost { background: none; border: 1px solid var(--border-strong); border-radius: 7px; padding: 7px 12px; font-size: 12.5px; cursor: pointer; color: var(--text-main); }
+
+#editor-main { flex: 1; display: flex; min-height: 0; }
+#editor-tools { width: 64px; border-right: 1px solid var(--border); background: var(--bg-panel-alt); display: flex; flex-direction: column; align-items: center; padding: 8px 0; gap: 4px; overflow-y: auto; }
+.tool-btn { width: 42px; height: 38px; border-radius: 8px; border: 1px solid transparent; background: none; font-size: 16px; cursor: pointer; color: var(--text-main); display: flex; align-items: center; justify-content: center; }
+.tool-btn:hover { background: var(--bg-hover); }
+.tool-btn.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+
+#editor-canvas-wrap { flex: 1; display: flex; align-items: center; justify-content: center; position: relative; background: repeating-conic-gradient(var(--bg-panel-alt) 0% 25%, var(--bg-panel) 0% 50%) 50% / 20px 20px; overflow: auto; padding: 16px; }
+#editor-canvas { background: #fff; box-shadow: 0 2px 20px rgba(0,0,0,0.2); cursor: crosshair; max-width: 100%; max-height: 100%; }
+
+#editor-sidebar { width: 190px; border-left: 1px solid var(--border); padding: 12px; background: var(--bg-panel-alt); font-size: 12px; color: var(--text-muted); overflow-y: auto; flex-shrink: 0; }
+#editor-sidebar label { display: block; margin: 10px 0 4px; font-size: 11px; color: var(--text-muted); }
+#editor-sidebar input[type=range] { width: 100%; }
+#editor-sidebar input[type=color] { width: 100%; height: 28px; border: 1px solid var(--border); border-radius: 6px; }
+#editor-sidebar button.ghost { width: 100%; margin-bottom: 6px; background: var(--bg-panel); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px; font-size: 12px; cursor: pointer; color: var(--text-main); }
+#editor-sidebar button.ghost:disabled { opacity: 0.45; cursor: default; }
+
+#editor-batch-strip { display: flex; gap: 6px; padding: 8px 14px; border-top: 1px solid var(--border); background: var(--bg-panel-alt); align-items: center; overflow-x: auto; flex-shrink: 0; }
+.batch-thumb { width: 44px; height: 32px; border-radius: 5px; border: 2px solid transparent; overflow: hidden; position: relative; cursor: pointer; flex-shrink: 0; background: var(--bg-panel); }
+.batch-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.batch-thumb.current { border-color: var(--accent); }
+.batch-thumb .dirty-dot { position: absolute; top: 2px; right: 2px; width: 6px; height: 6px; border-radius: 50%; background: var(--warn); }
+#editor-batch-nav { display: flex; gap: 6px; align-items: center; margin-left: auto; font-size: 12px; color: var(--text-muted); }
+#editor-batch-nav button { background: var(--bg-panel); border: 1px solid var(--border-strong); border-radius: 6px; padding: 5px 9px; cursor: pointer; font-size: 12px; }
+
+#editor-toast {
+  position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%) translateY(10px);
+  background: #1b1f24; color: #fff; padding: 10px 16px; border-radius: 8px; font-size: 13px;
+  opacity: 0; pointer-events: none; transition: all 160ms ease; z-index: 900;
+}
+#editor-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }

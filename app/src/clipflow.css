@@ -1,0 +1,179 @@
+:root {
+  --bg-panel: #ffffff;
+  --bg-panel-alt: #f4f5f7;
+  --bg-hover: #eef1f5;
+  --bg-selected: #e4ecff;
+  --text-main: #1b1f24;
+  --text-muted: #6b7280;
+  --text-faint: #9aa1ab;
+  --border: #e2e5ea;
+  --border-strong: #c9ced6;
+  --accent: #3b6fff;
+  --accent-soft: #e4ecff;
+  --danger: #e5484d;
+  --mono: "SF Mono", "Cascadia Code", Consolas, monospace;
+  --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg-panel: #1e2127;
+    --bg-panel-alt: #262a32;
+    --bg-hover: #2b2f38;
+    --bg-selected: #233253;
+    --text-main: #e7e9ee;
+    --text-muted: #9aa1ab;
+    --text-faint: #6b7280;
+    --border: #30343d;
+    --border-strong: #3c414c;
+    --accent: #4c7dff;
+    --accent-soft: #233253;
+  }
+}
+:root[data-theme="dark"] {
+  --bg-panel: #1e2127;
+  --bg-panel-alt: #262a32;
+  --bg-hover: #2b2f38;
+  --bg-selected: #233253;
+  --text-main: #e7e9ee;
+  --text-muted: #9aa1ab;
+  --text-faint: #6b7280;
+  --border: #30343d;
+  --border-strong: #3c414c;
+  --accent: #4c7dff;
+  --accent-soft: #233253;
+}
+
+* { box-sizing: border-box; }
+html[data-window="history"], html[data-window="history"] body, html[data-window="history"] #root { margin: 0; padding: 0; height: 100%; background: transparent; }
+html[data-window="history"] body {
+  font-family: var(--sans);
+  color: var(--text-main);
+  /* The OS window itself is transparent (tauri.conf.json) specifically so the
+     4 corners outside #clip-popup's border-radius show the desktop through,
+     instead of being filled in as hard square corners — a borderless window
+     has no native rounding of its own to fall back on. */
+  background: transparent;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+#clip-popup {
+  display: flex; flex-direction: column; height: 100vh;
+  background: var(--bg-panel);
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+}
+.popup-body { flex: 1; display: flex; min-height: 0; }
+
+#sidebar {
+  width: 168px; flex-shrink: 0;
+  background: var(--bg-panel-alt);
+  border-right: 1px solid var(--border);
+  padding: 10px 8px;
+  overflow-y: auto;
+}
+.sidebar-item {
+  display: flex; align-items: center; gap: 9px;
+  padding: 7px 9px; border-radius: 7px;
+  font-size: 13px; cursor: pointer; margin-bottom: 2px;
+}
+.sidebar-item .icon { width: 16px; text-align: center; font-size: 14px; }
+.sidebar-item .count { margin-left: auto; font-size: 11px; color: var(--text-faint); }
+.sidebar-item:hover { background: var(--bg-hover); }
+.sidebar-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+
+#list-panel {
+  overflow: hidden;
+  width: 300px; flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; min-height: 0;
+}
+/* min-width:0 on the input + flex-shrink:0 on the select: a text input's
+   default min-width is its intrinsic size (~170px), which together with the
+   select exceeded the 300px panel and pushed the dropdown into the preview. */
+#search-row { display: flex; align-items: center; gap: 6px; padding: 9px 10px; border-bottom: 1px solid var(--border); min-width: 0; }
+#search-row #search-input { min-width: 0; }
+#search-row #sort-select { flex-shrink: 0; max-width: 110px; }
+#search-input {
+  flex: 1; border: 1px solid var(--border); background: var(--bg-panel-alt);
+  border-radius: 7px; padding: 7px 10px; font-size: 13px; color: var(--text-main); outline: none;
+}
+#search-input:focus { border-color: var(--accent); }
+#sort-select { border: 1px solid var(--border); background: var(--bg-panel-alt); border-radius: 7px; padding: 6px; font-size: 12px; color: var(--text-muted); }
+#item-list { flex: 1; overflow-y: auto; padding: 6px; }
+
+.clip-item { display: flex; gap: 9px; align-items: flex-start; padding: 8px; border-radius: 8px; cursor: pointer; margin-bottom: 2px; border: 1px solid transparent; }
+.clip-item:hover { background: var(--bg-hover); }
+.clip-item.selected { background: var(--bg-selected); }
+.clip-item.active { border-color: var(--accent); }
+.clip-thumb { width: 38px; height: 38px; border-radius: 6px; flex-shrink: 0; background: var(--bg-panel-alt); display: flex; align-items: center; justify-content: center; font-size: 16px; overflow: hidden; border: 1px solid var(--border); }
+.clip-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.clip-meta { min-width: 0; flex: 1; }
+.clip-title { font-size: 12.5px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.clip-sub { font-size: 11px; color: var(--text-faint); margin-top: 2px; display: flex; gap: 6px; align-items: center; }
+#empty-list { padding: 30px 14px; text-align: center; color: var(--text-faint); font-size: 12.5px; }
+
+#preview-panel { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+#preview-header { padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 12.5px; color: var(--text-muted); display: flex; justify-content: space-between; align-items: center; }
+#preview-body { flex: 1; overflow-y: auto; padding: 14px; }
+.preview-card { background: var(--bg-panel-alt); border: 1px solid var(--border); border-radius: 10px; padding: 10px; margin-bottom: 12px; position: relative; }
+.preview-card img { width: 100%; border-radius: 6px; display: block; }
+.preview-card .card-caption { font-size: 11px; color: var(--text-faint); margin-top: 6px; }
+.preview-text { white-space: pre-wrap; font-size: 13px; line-height: 1.55; font-family: var(--mono); background: var(--bg-panel-alt); border: 1px solid var(--border); border-radius: 10px; padding: 12px; }
+.preview-link-domain { font-size: 11px; color: var(--text-faint); margin-bottom: 4px; }
+.preview-link-url { font-size: 13px; color: var(--accent); word-break: break-all; }
+#preview-empty { color: var(--text-faint); font-size: 13px; text-align: center; margin-top: 60px; }
+#preview-count-badge { background: var(--accent); color: #fff; font-size: 11px; padding: 2px 8px; border-radius: 10px; }
+
+.icon-btn { background: none; border: 1px solid var(--border-strong); border-radius: 6px; padding: 4px 7px; font-size: 11px; cursor: pointer; color: var(--text-main); }
+.icon-btn:hover { background: var(--bg-hover); }
+.icon-btn.primary { color: #fff; background: var(--accent); border-color: var(--accent); }
+.icon-btn.primary:hover { filter: brightness(1.06); }
+.icon-btn.danger { color: var(--danger); border-color: var(--danger); }
+
+.modal-backdrop {
+  position: fixed; inset: 0; z-index: 1000;
+  display: flex; align-items: center; justify-content: center;
+  padding: 20px; background: rgba(0, 0, 0, 0.38);
+}
+.recovery-dialog {
+  width: min(430px, 100%); padding: 18px;
+  color: var(--text-main); background: var(--bg-panel);
+  border: 1px solid var(--border-strong); border-radius: 12px;
+  box-shadow: 0 20px 55px rgba(0, 0, 0, 0.34);
+}
+.recovery-title { margin-bottom: 10px; font-size: 15px; font-weight: 650; }
+.recovery-copied, .recovery-warning {
+  margin-bottom: 10px; padding: 9px 10px; border-radius: 7px;
+  font-size: 12.5px; line-height: 1.45;
+}
+.recovery-copied { color: #176b3a; background: rgba(45, 164, 78, 0.13); }
+.recovery-warning { color: var(--danger); background: rgba(229, 72, 77, 0.12); }
+.recovery-message { color: var(--text-muted); font-size: 12.5px; line-height: 1.55; }
+.recovery-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+/* Fixed height + overflow:hidden + nowrap on every child: the window is
+   user-resizable, and without this the hint text wraps onto a second line
+   that has nowhere to go but spill out of the 36px bar (visible "UI overflow"
+   bug at narrow widths). The long trailing message truncates with an
+   ellipsis instead of wrapping; the short key hints never shrink. */
+#toolbar { height: 36px; flex-shrink: 0; overflow: hidden; border-top: 1px solid var(--border); background: var(--bg-panel-alt); display: flex; align-items: center; gap: 14px; padding: 0 14px; font-size: 11.5px; color: var(--text-muted); white-space: nowrap; }
+#toolbar > span { flex-shrink: 0; }
+#toolbar .hint-key { background: var(--bg-panel); border: 1px solid var(--border-strong); border-radius: 4px; padding: 1px 5px; font-size: 10.5px; margin-right: 3px; color: var(--text-main); }
+#toolbar .spacer { flex: 1 1 auto; min-width: 0; }
+#toolbar .dest { color: var(--accent); font-weight: 500; }
+#toolbar .truncate { flex-shrink: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+#toast {
+  position: fixed; bottom: 48px; left: 50%; transform: translateX(-50%) translateY(10px);
+  max-width: 88%; white-space: normal; text-align: center; line-height: 1.45;
+  background: #1b1f24; color: #fff; padding: 10px 16px; border-radius: 8px;
+  font-size: 13px; opacity: 0; pointer-events: none; transition: all 160ms ease; z-index: 900;
+}
+#toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
