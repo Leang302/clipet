@@ -3,13 +3,16 @@
 //!
 //! - `engine` — pure word tracking and match/escape decisions (unit-tested).
 //! - `store` — SQLite persistence for snippets and their settings.
-//! - `macos` — the native keyboard hook and text injection. Other platforms
-//!   report the listener as unsupported until their hook is implemented.
+//! - `macos` / `windows` — the native keyboard hook and text injection. Other
+//!   platforms report the listener as unsupported until their hook is
+//!   implemented.
 
 pub mod engine;
 #[cfg(target_os = "macos")]
 mod macos;
 pub mod store;
+#[cfg(windows)]
+mod windows;
 
 use engine::{EngineConfig, IndexedSnippet, SnippetIndex};
 use serde::{Deserialize, Serialize};
@@ -88,7 +91,9 @@ pub struct SnippetService {
 
 static DIAG: OnceLock<Mutex<std::sync::mpsc::Sender<String>>> = OnceLock::new();
 
-/// Appends one line to `~/Library/Logs/com.clipflow.app/snippets.log`.
+/// Appends one line to `snippets.log` in the app's log folder
+/// (`~/Library/Logs/com.clipflow.app/` on macOS,
+/// `%LOCALAPPDATA%\com.clipflow.app\logs\` on Windows).
 /// Records listener events and expansion outcomes only — never typed text.
 /// Writes happen on a background thread so the keyboard hook never waits on
 /// disk I/O.
@@ -188,7 +193,9 @@ impl SnippetService {
         self.spawn_pause_timer();
         #[cfg(target_os = "macos")]
         macos::start(self.clone(), monitor);
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(windows)]
+        windows::start(self.clone(), monitor);
+        #[cfg(not(any(target_os = "macos", windows)))]
         {
             let _ = monitor;
             self.set_listener(ListenerState::Unsupported);

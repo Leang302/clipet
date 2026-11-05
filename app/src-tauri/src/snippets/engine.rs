@@ -1,6 +1,6 @@
 //! Platform-independent text-expansion logic.
 //!
-//! The native keyboard hook (see `macos.rs`) classifies each key-down into a
+//! The native keyboard hook (see `macos.rs` / `windows.rs`) classifies each key-down into a
 //! [`KeyInput`] and feeds it here. The engine keeps, in memory only, the short
 //! stretch of text it knows sits left of the caret (at most 256 characters,
 //! cleared on every click, arrow key or app switch) — enough to find the
