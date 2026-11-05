@@ -43,7 +43,11 @@ const OBJECT_TOOLS: Tool[] = ["select", "text", ...SHAPE_KINDS];
 type TextObj = { kind: "text"; id: string; x: number; y: number; text: string; color: string; size: number };
 type ShapeObj = { kind: ShapeKind; id: string; x1: number; y1: number; x2: number; y2: number; color: string; width: number };
 type Obj = TextObj | ShapeObj;
-type HitPart = "body" | "resize" | "p1" | "p2";
+// p1/p2 are the shape's defining points (line ends, or opposite box corners);
+// c3/c4 are a box's other two corners: c3 = (x2, y1), c4 = (x1, y2).
+type HitPart = "body" | "resize" | "p1" | "p2" | "c3" | "c4";
+type Zoom = "fit" | number; // number = 1 means 100% (actual size on screen)
+const ZOOM_STEPS = [0.1, 0.25, 0.33, 0.5, 0.67, 0.75, 1, 1.25, 1.5, 2, 3, 4, 6, 8];
 
 type ImgState = {
   baseHistory: string[]; // data URLs, index 0 = original load
@@ -176,8 +180,14 @@ export default function Editor() {
   const [textValue, setTextValue] = useState("");
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [zoom, setZoom] = useState<Zoom>("fit");
+  const [wrapSize, setWrapSize] = useState({ w: 0, h: 0 });
+  const [panning, setPanning] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const wrapRef = useRef<HTMLDivElement | null>(null);
+  const spaceHeld = useRef(false);
+  const panRef = useRef<{ x: number; y: number; left: number; top: number } | null>(null);
   const imgStates = useRef<Record<string, ImgState>>({});
   const dragRef = useRef<DragInfo | null>(null);
   const objDragRef = useRef<ObjDrag | null>(null);
@@ -263,9 +273,12 @@ export default function Editor() {
     const annoSrc = st.annoHistory[st.idx];
     const anno = annoSrc ? await getImg(annoSrc) : null;
     if (dragRef.current || objDragRef.current) return; // a drag started meanwhile; it owns the canvas
-    if (!st.w) {
+    // Every history step stores a full-size base image, so its natural size is
+    // the canvas size at that step — including after undoing a crop.
+    if (st.w !== base.naturalWidth || st.h !== base.naturalHeight) {
       st.w = base.naturalWidth;
       st.h = base.naturalHeight;
+      setTick((t) => t + 1); // re-layout the canvas at the new size
     }
     // Assigning width/height wipes a canvas even when unchanged — only do it on a real resize.
     if (canvas.width !== st.w || canvas.height !== st.h) {
@@ -283,14 +296,17 @@ export default function Editor() {
     return r.width ? c.width / r.width : 1;
   }
 
-  /** Handle centers for the selected object (canvas coordinates). */
+  /** Handle centers for the selected object (canvas coordinates): a resize
+   *  handle for text, both ends for lines/arrows, all four corners for boxes. */
   function handlesFor(ctx: CanvasRenderingContext2D, o: Obj): { part: HitPart; x: number; y: number }[] {
     if (o.kind === "text") {
       const pad = 4 * canvasScale();
       const b = objBox(ctx, o);
       return [{ part: "resize", x: b.x + b.w + pad, y: b.y + b.h + pad }];
     }
-    return [{ part: "p1", x: o.x1, y: o.y1 }, { part: "p2", x: o.x2, y: o.y2 }];
+    const ends: { part: HitPart; x: number; y: number }[] = [{ part: "p1", x: o.x1, y: o.y1 }, { part: "p2", x: o.x2, y: o.y2 }];
+    if (o.kind === "line" || o.kind === "arrow") return ends;
+    return [...ends, { part: "c3", x: o.x2, y: o.y1 }, { part: "c4", x: o.x1, y: o.y2 }];
   }
 
   /** Draws base + raster layer + objects (+ selection UI) in one synchronous pass. */
@@ -317,8 +333,9 @@ export default function Editor() {
     ctx.fillStyle = "#fff";
     for (const h of handlesFor(ctx, sel)) {
       ctx.beginPath();
-      if (sel.kind === "text") ctx.rect(h.x - hs / 2, h.y - hs / 2, hs, hs);
-      else ctx.arc(h.x, h.y, hs / 2, 0, Math.PI * 2);
+      // Square handles resize boxes and text; round handles move line ends.
+      if (sel.kind === "line" || sel.kind === "arrow") ctx.arc(h.x, h.y, hs / 2, 0, Math.PI * 2);
+      else ctx.rect(h.x - hs / 2, h.y - hs / 2, hs, hs);
       ctx.fill();
       ctx.stroke();
     }
@@ -342,8 +359,11 @@ export default function Editor() {
         if (Math.hypot(p.x - h.x, p.y - h.y) <= 10 * s) return { o: sel, part: h.part };
       }
     }
-    for (let i = objs.length - 1; i >= 0; i--) {
-      const o = objs[i];
+    // The selected object wins over ones stacked above it, so an object that
+    // was picked by its visible edge can then be dragged from anywhere on it.
+    const ordered = sel ? [...objs.filter((o) => o !== sel), sel] : objs;
+    for (let i = ordered.length - 1; i >= 0; i--) {
+      const o = ordered[i];
       const isSel = o.id === selectedId;
       if (o.kind === "text") {
         const b = objBox(ctx, o);
@@ -462,12 +482,6 @@ export default function Editor() {
     return { x: (e.clientX - r.left) * sx, y: (e.clientY - r.top) * sy };
   }
 
-  function syncSidebarTo(o: Obj) {
-    setColor(o.color);
-    if (o.kind === "text") setFontSize(o.size);
-    else setThickness(o.width);
-  }
-
   async function committedLayers(id: string) {
     const st = imgStates.current[id];
     // Already decoded by renderCanvas, so these resolve from the cache.
@@ -478,7 +492,7 @@ export default function Editor() {
   }
 
   async function onPointerDown(e: React.PointerEvent) {
-    if (!currentId) return;
+    if (!currentId || panRef.current) return;
     const id = currentId;
     const p = canvasPoint(e);
 
@@ -487,7 +501,6 @@ export default function Editor() {
       if (hit) {
         setSelectedId(hit.o.id);
         lastStyleEditRef.current = null;
-        syncSidebarTo(hit.o);
         canvasRef.current?.setPointerCapture(e.pointerId);
         const { baseImg, annoImg } = await committedLayers(id);
         objDragRef.current = {
@@ -533,11 +546,15 @@ export default function Editor() {
         const origH = orig.size * 1.2;
         const size = Math.round(Math.min(400, Math.max(8, orig.size * ((origH + dy) / origH))));
         od.working[i] = { ...orig, size };
-        setFontSize(size);
       } else if (orig.kind !== "text") {
-        od.working[i] = od.mode === "p1"
-          ? { ...orig, x1: orig.x1 + dx, y1: orig.y1 + dy }
-          : { ...orig, x2: orig.x2 + dx, y2: orig.y2 + dy };
+        const m = od.mode;
+        od.working[i] = {
+          ...orig,
+          x1: m === "p1" || m === "c4" ? orig.x1 + dx : orig.x1,
+          y1: m === "p1" || m === "c3" ? orig.y1 + dy : orig.y1,
+          x2: m === "p2" || m === "c3" ? orig.x2 + dx : orig.x2,
+          y2: m === "p2" || m === "c4" ? orig.y2 + dy : orig.y2,
+        };
       }
       paintScene(imgStates.current[od.id], od.baseImg, od.annoImg, od.working, od.objId);
       return;
@@ -546,9 +563,18 @@ export default function Editor() {
     if (OBJECT_TOOLS.includes(tool) && currentId && !dragRef.current) {
       const hit = hitObject(currentId, canvasPoint(e));
       const idle = tool === "select" ? "default" : tool === "text" ? "text" : "crosshair";
+      const corner = (part: HitPart, o: Obj) => {
+        if (o.kind === "text" || o.kind === "line" || o.kind === "arrow") return "grab";
+        // Diagonal through the top-left/bottom-right corners → nwse, otherwise nesw.
+        const hx = part === "p1" || part === "c4" ? o.x1 : o.x2;
+        const hy = part === "p1" || part === "c3" ? o.y1 : o.y2;
+        const ox = part === "p1" || part === "c4" ? o.x2 : o.x1;
+        const oy = part === "p1" || part === "c3" ? o.y2 : o.y1;
+        return (hx - ox) * (hy - oy) > 0 ? "nwse-resize" : "nesw-resize";
+      };
       canvasRef.current!.style.cursor = !hit ? idle
         : hit.part === "body" ? "move"
-        : hit.part === "resize" ? "nwse-resize" : "grab";
+        : hit.part === "resize" ? "nwse-resize" : corner(hit.part, hit.o);
     }
 
     const drag = dragRef.current;
@@ -793,7 +819,16 @@ export default function Editor() {
       // swallow "delete the selected object".
       const el = e.target as HTMLElement;
       const inField = el?.tagName === "TEXTAREA" || (el?.tagName === "INPUT" && (el as HTMLInputElement).type === "text");
-      if (mod && key === "z" && !e.shiftKey) { e.preventDefault(); undo(); }
+      if (mod && (key === "=" || key === "+")) { e.preventDefault(); zoomBy(1); }
+      else if (mod && key === "-") { e.preventDefault(); zoomBy(-1); }
+      else if (mod && key === "0") { e.preventDefault(); setZoom("fit"); }
+      else if (mod && key === "1") { e.preventDefault(); setZoom(1); }
+      else if (e.key === " " && !inField) {
+        // Hold Space and drag to pan, like other image editors.
+        e.preventDefault();
+        if (!spaceHeld.current) { spaceHeld.current = true; setPanning(true); }
+      }
+      else if (mod && key === "z" && !e.shiftKey) { e.preventDefault(); undo(); }
       else if (mod && (key === "y" || (key === "z" && e.shiftKey))) { e.preventDefault(); redo(); }
       else if ((e.key === "Delete" || e.key === "Backspace") && selectedId && !inField) { e.preventDefault(); deleteSelected(); }
       else if (e.key === "Escape") {
@@ -808,11 +843,94 @@ export default function Editor() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [targets, tick, textEntry, confirmDiscard, selectedId, currentId]);
 
+  useEffect(() => {
+    function onKeyUp(e: KeyboardEvent) {
+      if (e.key === " ") { spaceHeld.current = false; setPanning(false); }
+    }
+    document.addEventListener("keyup", onKeyUp);
+    return () => document.removeEventListener("keyup", onKeyUp);
+  }, []);
+
+  // Track the canvas area's size so "Fit" stays fitted as the window resizes.
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    if (!wrap) return;
+    const ro = new ResizeObserver(([entry]) => setWrapSize({ w: entry.contentRect.width, h: entry.contentRect.height }));
+    ro.observe(wrap);
+    // Pinch (and Ctrl+wheel) zooms. Must be non-passive to stop page zoom.
+    function onWheel(e: WheelEvent) {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      zoomByRef.current(e.deltaY < 0 ? 1 : -1);
+    }
+    wrap.addEventListener("wheel", onWheel, { passive: false });
+    return () => { ro.disconnect(); wrap.removeEventListener("wheel", onWheel); };
+  }, []);
+
   const currentItem = currentId ? items[currentId] : undefined;
   const currentSt = currentId ? imgStates.current[currentId] : undefined;
+
+  // Canvas pixels are image pixels; zoom only changes its CSS size. 100% shows
+  // one image pixel per device pixel, so a Retina screenshot appears at the
+  // size it had on screen. "Fit" never enlarges past 100%.
+  const dpr = window.devicePixelRatio || 1;
+  const imgW = currentSt?.w ?? 0;
+  const imgH = currentSt?.h ?? 0;
+  const fitScale = imgW && imgH && wrapSize.w && wrapSize.h
+    ? Math.min(wrapSize.w / imgW, wrapSize.h / imgH, 1 / dpr)
+    : 1 / dpr;
+  const cssScale = zoom === "fit" ? fitScale : zoom / dpr;
+  const zoomPct = Math.round(cssScale * dpr * 100);
+
+  function zoomBy(direction: 1 | -1) {
+    const current = cssScale * dpr;
+    const next = direction > 0
+      ? ZOOM_STEPS.find((z) => z > current + 0.001) ?? ZOOM_STEPS[ZOOM_STEPS.length - 1]
+      : [...ZOOM_STEPS].reverse().find((z) => z < current - 0.001) ?? ZOOM_STEPS[0];
+    setZoom(next);
+  }
+  const zoomByRef = useRef(zoomBy);
+  zoomByRef.current = zoomBy;
+
+  // Handle sizes depend on the on-screen scale, so repaint after zooming.
+  useEffect(() => { setTick((t) => t + 1); }, [cssScale]);
+
+  function onWrapPointerDown(e: React.PointerEvent) {
+    if (!spaceHeld.current || !wrapRef.current) return;
+    e.preventDefault();
+    e.stopPropagation();
+    panRef.current = { x: e.clientX, y: e.clientY, left: wrapRef.current.scrollLeft, top: wrapRef.current.scrollTop };
+    wrapRef.current.setPointerCapture(e.pointerId);
+  }
+  function onWrapPointerMove(e: React.PointerEvent) {
+    const pan = panRef.current;
+    if (!pan || !wrapRef.current) return;
+    wrapRef.current.scrollLeft = pan.left - (e.clientX - pan.x);
+    wrapRef.current.scrollTop = pan.top - (e.clientY - pan.y);
+  }
+  function onWrapPointerUp() {
+    panRef.current = null;
+  }
   const selectedObj = currentId && selectedId ? currentObjs(currentId).find((o) => o.id === selectedId) : undefined;
-  const selTag = (kind: "any" | "text" | "shape") =>
-    !selectedObj ? "" : kind === "any" || (kind === "text") === (selectedObj.kind === "text") ? " (selected)" : "";
+  // Properties show the selected object's own values when something is
+  // selected, otherwise the current tool's defaults for the next object —
+  // and only the properties that apply.
+  const props = selectedObj
+    ? {
+      title: selectedObj.kind === "text" ? "Selected text" : `Selected ${selectedObj.kind}`,
+      color: true,
+      width: selectedObj.kind !== "text",
+      size: selectedObj.kind === "text",
+    }
+    : {
+      title: `${TOOLS.find((t) => t.key === tool)?.label ?? ""} tool`,
+      color: ["pen", "highlighter", "text", ...SHAPE_KINDS].includes(tool),
+      width: ["pen", "highlighter", "eraser", ...SHAPE_KINDS].includes(tool),
+      size: tool === "text",
+    };
+  const shownColor = selectedObj ? selectedObj.color : color;
+  const shownWidth = selectedObj && selectedObj.kind !== "text" ? selectedObj.width : thickness;
+  const shownSize = selectedObj && selectedObj.kind === "text" ? selectedObj.size : fontSize;
 
   return (
     <div id="editor-shell">
@@ -822,6 +940,13 @@ export default function Editor() {
           {currentItem ? ` — ${currentItem.content}` : ""}
         </span>
         <span className="spacer"></span>
+        <div id="editor-zoom">
+          <button title="Zoom out (⌘−)" onClick={() => zoomBy(-1)}>−</button>
+          <span className="pct">{zoomPct}%</span>
+          <button title="Zoom in (⌘+)" onClick={() => zoomBy(1)}>+</button>
+          <button className={zoom === "fit" ? "on" : ""} title="Fit to window (⌘0)" onClick={() => setZoom("fit")}>Fit</button>
+          <button className={zoom === 1 ? "on" : ""} title="Actual size (⌘1)" onClick={() => setZoom(1)}>100%</button>
+        </div>
         <button className="ghost" onClick={handleCancel}>Cancel</button>
         <button className="primary" onClick={handleDone}>Done</button>
       </div>
@@ -838,10 +963,18 @@ export default function Editor() {
             </button>
           ))}
         </div>
-        <div id="editor-canvas-wrap">
+        <div
+          id="editor-canvas-wrap"
+          ref={wrapRef}
+          className={panning ? "panning" : ""}
+          onPointerDownCapture={onWrapPointerDown}
+          onPointerMove={onWrapPointerMove}
+          onPointerUp={onWrapPointerUp}
+        >
           <canvas
             id="editor-canvas"
             ref={canvasRef}
+            style={imgW ? { width: imgW * cssScale, height: imgH * cssScale } : undefined}
             onPointerDown={onPointerDown}
             onPointerMove={onPointerMove}
             onPointerUp={onPointerUp}
@@ -849,30 +982,48 @@ export default function Editor() {
           />
         </div>
         <div id="editor-sidebar">
-          <label>Color{selTag("any")}</label>
-          <input
-            type="color"
-            value={color}
-            onChange={(e) => { setColor(e.target.value); styleSelected({ color: e.target.value }); }}
-          />
-          <label>Thickness {thickness}px{selTag("shape")}</label>
-          <input
-            type="range" min={1} max={30} value={thickness}
-            onChange={(e) => { const w = Number(e.target.value); setThickness(w); styleSelected({ width: w }); }}
-          />
-          <label>Font size {fontSize}px{selTag("text")}</label>
-          <input
-            type="range" min={8} max={200} value={fontSize}
-            onChange={(e) => { const s = Number(e.target.value); setFontSize(s); styleSelected({ size: s }); }}
-          />
+          <div className="section-title">{props.title}</div>
+          {props.color && (
+            <>
+              <label>Color</label>
+              <input
+                type="color"
+                value={shownColor}
+                onChange={(e) => { if (selectedObj) styleSelected({ color: e.target.value }); else setColor(e.target.value); }}
+              />
+            </>
+          )}
+          {props.width && (
+            <>
+              <label>Thickness {shownWidth}px</label>
+              <input
+                type="range" min={1} max={30} value={shownWidth}
+                onChange={(e) => { const w = Number(e.target.value); if (selectedObj) styleSelected({ width: w }); else setThickness(w); }}
+              />
+            </>
+          )}
+          {props.size && (
+            <>
+              <label>Font size {shownSize}px</label>
+              <input
+                type="range" min={8} max={200} value={shownSize}
+                onChange={(e) => { const s = Number(e.target.value); if (selectedObj) styleSelected({ size: s }); else setFontSize(s); }}
+              />
+            </>
+          )}
+          {!props.color && !props.width && !props.size && (
+            <p className="hint">
+              {tool === "select" ? "Click a shape or text to select it." : "Drag over the area to apply."}
+            </p>
+          )}
           {selectedObj && (
             <button className="ghost" style={{ marginTop: 12, color: "#e5484d", borderColor: "#e5484d" }} onClick={deleteSelected}>
               Delete selected
             </button>
           )}
           {OBJECT_TOOLS.includes(tool) && (
-            <p style={{ marginTop: 8, fontSize: 11, lineHeight: 1.5 }}>
-              Click a shape or text to select · drag to move · drag the handles to reshape · double-click text to edit · <b>Delete</b> removes
+            <p className="hint">
+              Click to select · drag to move · drag handles to resize · double-click text to edit · <b>Delete</b> removes · <b>Esc</b> deselects
             </p>
           )}
           <label style={{ marginTop: 16 }}>History</label>
@@ -880,7 +1031,8 @@ export default function Editor() {
           <button className="ghost" disabled={!currentSt || currentSt.idx >= currentSt.baseHistory.length - 1} onClick={redo}>Redo</button>
           <p style={{ marginTop: 16, fontSize: 11, lineHeight: 1.5 }}>
             <b>Enter</b> save &amp; close · <b>Esc</b> cancel<br />
-            <b>⌘/Ctrl+Z</b> undo · <b>⌘/Ctrl+Y</b> redo
+            <b>⌘/Ctrl+Z</b> undo · <b>⌘/Ctrl+Y</b> redo<br />
+            <b>⌘+ / ⌘−</b> zoom · <b>⌘0</b> fit · hold <b>Space</b> and drag to pan
           </p>
         </div>
       </div>
@@ -894,7 +1046,7 @@ export default function Editor() {
                 className={"batch-thumb" + (i === index ? " current" : "")}
                 onClick={() => setIndex(i)}
               >
-                {st && <img src={st.baseHistory[st.idx]} alt="" />}
+                {st && <img src={st.baseHistory[st.idx]} alt="" draggable={false} />}
                 {isDirty(id) && <div className="dirty-dot" />}
               </div>
             );

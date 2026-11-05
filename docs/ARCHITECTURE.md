@@ -79,6 +79,14 @@ An all-image selection is validated and transferred in one clipboard generation 
 
 Destination applications still decide which pasteboard items and formats they accept, so the compatibility matrix across Word, Slack, Mail, Finder/Explorer, Photoshop, and the user's actual target apps remains a required interactive check. Export/combine/contact-sheet and drag-and-drop remain future explicit fallbacks.
 
+## Smart Snippets
+
+- `src-tauri/src/snippets/engine.rs` is the platform-independent core. It tracks the current word and decides Pass / Expand / Escape, synchronously, when Space or Tab arrives. It is fully unit-tested.
+- `snippets/store.rs` keeps snippets and their settings in a **separate `snippets.sqlite3`**, so no history, cache or image cleanup can delete them. Schema changes go through `PRAGMA user_version` migrations.
+- `snippets/mod.rs` (`SnippetService`) holds the live index, swapped atomically on every change. It also owns the pause state (an atomic wall-clock deadline, a timer thread for the tray, and a generation counter so the hook drops half-typed words), plus the Tauri commands.
+- `snippets/macos.rs` is the native layer: a session `CGEventTap` thread, a replacement worker, and main-thread injection via enigo. Injected events carry `EVENT_SOURCE_USER_DATA` marks so the tap ignores them. Keys typed during a replacement are held and replayed in order.
+- Windows has no backend yet. That will need a `WH_KEYBOARD_LL` hook behind the same `SnippetService` interface; until then the listener reports `unsupported`.
+
 ## Known gaps (tracked, not hidden)
 
 - No file/HTML/RTF clipboard capture yet (see above).

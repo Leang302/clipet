@@ -104,6 +104,13 @@ fn ingest_image(
     img: &arboard::ImageData,
     hash: &str,
 ) {
+    // Copying an image that's already in history moves it to the top instead
+    // of storing (and OCR-ing) a second identical file.
+    if let Some((existing, _)) = db::find_image_by_hash(conn, hash) {
+        db::touch_item(conn, &existing, chrono::Utc::now().timestamp_millis());
+        let _ = app.emit("clipflow://new-item", &existing);
+        return;
+    }
     let id = uuid_like();
     let file_name = format!("{id}.png");
     let path = data_dir.join("images").join(&file_name);
@@ -124,6 +131,7 @@ fn ingest_image(
         conn, &id, "image", &file_name, &preview, "", created_at, hash,
     );
     let _ = app.emit("clipflow://new-item", &id);
+    crate::ocr::wake(app);
 }
 
 fn looks_like_url(s: &str) -> bool {

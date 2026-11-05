@@ -34,9 +34,15 @@ base64 = "0.22"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
+core-graphics = "0.25"
+foreign-types = "0.5"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["libc", "NSPasteboard", "NSPasteboardItem", "NSRunningApplication", "NSWorkspace", "std"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSData", "NSString", "NSURL", "std"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["NSArray", "NSData", "NSDictionary", "NSError", "NSString", "NSURL", "std"] }
+objc2-vision = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "VNTypes"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Foundation", "Foundation_Collections", "Globalization", "Graphics_Imaging", "Media_Ocr", "Storage", "Storage_Streams", "Win32_System_WinRT"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

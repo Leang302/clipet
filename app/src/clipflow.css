@@ -106,8 +106,6 @@ html[data-window="history"] body {
 
 .clip-item { display: flex; gap: 9px; align-items: flex-start; padding: 8px; border-radius: 8px; cursor: pointer; margin-bottom: 2px; border: 1px solid transparent; }
 .clip-item:hover { background: var(--bg-hover); }
-.clip-item.selected { background: var(--bg-selected); }
-.clip-item.active { border-color: var(--accent); }
 .clip-thumb { width: 38px; height: 38px; border-radius: 6px; flex-shrink: 0; background: var(--bg-panel-alt); display: flex; align-items: center; justify-content: center; font-size: 16px; overflow: hidden; border: 1px solid var(--border); }
 .clip-thumb img { width: 100%; height: 100%; object-fit: cover; }
 .clip-meta { min-width: 0; flex: 1; }
@@ -177,3 +175,89 @@ html[data-window="history"] body {
 ::-webkit-scrollbar { width: 9px; height: 9px; }
 ::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ---------- Smart Snippets ---------- */
+.sidebar-divider { height: 1px; background: var(--border); margin: 6px 4px; }
+.snippet-item.disabled .clip-title { opacity: 0.55; }
+.snippet-item .clip-title { display: flex; align-items: baseline; gap: 6px; min-width: 0; }
+.snippet-item .clip-sub .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.snippet-trigger { font-family: var(--mono); font-size: 12px; color: var(--accent); background: var(--accent-soft); border-radius: 4px; padding: 1px 5px; flex-shrink: 0; }
+.snippet-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.snippet-badge { font-size: 11px; color: var(--text-muted); border: 1px solid var(--border-strong); border-radius: 4px; padding: 1px 5px; }
+.snippet-detail-trigger { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; }
+.snippet-status { display: flex; align-items: center; gap: 7px; padding: 6px 10px; font-size: 11.5px; color: var(--text-muted); border-bottom: 1px solid var(--border); min-width: 0; }
+.snippet-status .truncate { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.snippet-status .dot { width: 7px; height: 7px; border-radius: 50%; background: #2fb36b; flex-shrink: 0; }
+.snippet-status.muted .dot { background: var(--text-faint); }
+.snippet-status.warn .dot { background: #e5a23b; }
+.snippet-status.warn { color: var(--text-main); }
+.snippet-pause-select { flex-shrink: 0; font-size: 11px; padding: 2px 4px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--bg-panel); color: var(--text-main); }
+.snippet-form { display: flex; flex-direction: column; gap: 12px; }
+.snippet-form label { display: flex; flex-direction: column; gap: 5px; font-size: 12px; color: var(--text-muted); }
+.snippet-form input:not([type="checkbox"]), .snippet-form textarea, .snippet-form select { font: inherit; font-size: 13px; color: var(--text-main); background: var(--bg-panel); border: 1px solid var(--border-strong); border-radius: 7px; padding: 6px 8px; min-width: 0; }
+.snippet-form textarea { font-family: var(--mono); resize: vertical; line-height: 1.5; }
+.snippet-form input:focus, .snippet-form textarea:focus, .snippet-form select:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.snippet-form small { font-size: 11.5px; color: var(--text-faint); }
+.snippet-form .snippet-check { flex-direction: row; align-items: center; gap: 8px; color: var(--text-main); }
+.snippet-keyword-field { display: flex; align-items: stretch; }
+.snippet-keyword-field .snippet-prefix { font-family: var(--mono); font-size: 13px; padding: 6px 8px; border: 1px solid var(--border-strong); border-right: none; border-radius: 7px 0 0 7px; background: var(--bg-panel-alt); color: var(--accent); }
+.snippet-keyword-field input { flex: 1; font-family: var(--mono) !important; border-radius: 0 7px 7px 0 !important; }
+.snippet-prefix-input { width: 48px; font-family: var(--mono) !important; text-align: center; }
+.snippet-error { color: var(--danger) !important; font-size: 12px; }
+.snippet-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.snippet-actions.wrap { justify-content: flex-start; flex-wrap: wrap; margin-top: 10px; }
+.snippet-actions .hint { opacity: 0.75; margin-left: 4px; }
+.context-backdrop { position: fixed; inset: 0; z-index: 900; }
+.context-menu { position: fixed; min-width: 180px; padding: 4px; background: var(--bg-panel); border: 1px solid var(--border-strong); border-radius: 8px; box-shadow: 0 12px 30px rgba(0,0,0,0.22); display: flex; flex-direction: column; }
+.context-menu button { text-align: left; background: none; border: none; border-radius: 5px; padding: 6px 9px; font-size: 12.5px; color: var(--text-main); cursor: pointer; }
+.context-menu button:hover:not(:disabled) { background: var(--accent); color: #fff; }
+.context-menu button.danger { color: var(--danger); }
+.context-menu button:disabled { opacity: 0.5; cursor: default; }
+
+/* ---------- Native-app selection behavior ----------
+   The popup is UI chrome, not a document: clicks, drags and Shift+Click range
+   selection must never paint the webview's text selection across labels,
+   counts, buttons or thumbnails. Editable fields and content meant to be
+   copied (marked .selectable) keep normal text selection. */
+#clip-popup { -webkit-user-select: none; user-select: none; cursor: default; }
+#clip-popup input, #clip-popup textarea, #clip-popup .selectable { -webkit-user-select: text; user-select: text; cursor: auto; }
+#clip-popup img { -webkit-user-drag: none; }
+
+/* Selection vs keyboard focus: selected items get a fill; the keyboard cursor
+   (the item arrows move and Enter pastes from) gets an inner ring. One
+   selected item that is also the cursor shows only the fill. */
+.clip-item.selected { background: var(--bg-selected); }
+.clip-item.active { border-color: transparent; box-shadow: inset 0 0 0 1.5px var(--accent); }
+.clip-item.selected.active.single { box-shadow: none; }
+.clip-check { width: 16px; height: 16px; border-radius: 50%; flex-shrink: 0; align-self: center; border: 1.5px solid var(--border-strong); display: flex; align-items: center; justify-content: center; font-size: 10px; color: #fff; }
+.clip-item.selected .clip-check { background: var(--accent); border-color: var(--accent); }
+.icon-btn:focus-visible, .sidebar-item:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.icon-btn:disabled { opacity: 0.5; cursor: default; }
+.ocr-chip { font-size: 10px; color: var(--accent); background: var(--accent-soft); border-radius: 4px; padding: 0 5px; }
+.ocr-section { margin-top: 10px; }
+.ocr-section summary { font-size: 11.5px; color: var(--text-muted); cursor: pointer; }
+.ocr-text { white-space: pre-wrap; font-size: 12px; line-height: 1.5; max-height: 320px; overflow-y: auto; margin-top: 6px; padding: 8px; border-radius: 8px; background: var(--bg-panel); border: 1px solid var(--border); }
+.ocr-image { position: relative; }
+.ocr-hit { position: absolute; border-radius: 3px; background: rgba(255, 196, 0, 0.35); box-shadow: 0 0 0 1.5px rgba(255, 170, 0, 0.9); pointer-events: none; }
+.sidebar-setting { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--text-muted); margin-top: 8px; padding: 0 2px; }
+.sidebar-setting small { display: block; color: var(--text-faint); font-size: 10.5px; }
+.ocr-section summary .ocr-count, .ocr-section summary .ocr-state { color: var(--text-faint); }
+.ocr-section summary .ocr-state.error, .ocr-empty.error { color: var(--danger); }
+.ocr-empty { font-size: 12px; color: var(--text-muted); margin-top: 6px; }
+.ocr-actions { display: flex; gap: 6px; margin-top: 6px; }
+.sidebar-select { width: 100%; margin-top: 6px; font-size: 11.5px; padding: 4px 6px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--bg-panel); color: var(--text-main); }
+
+/* Image snippets */
+.snippet-type { display: inline-flex; align-self: flex-start; border: 1px solid var(--border-strong); border-radius: 7px; overflow: hidden; }
+.snippet-type button { font: inherit; font-size: 12px; padding: 4px 14px; border: none; background: var(--bg-panel); color: var(--text-muted); cursor: pointer; }
+.snippet-type button + button { border-left: 1px solid var(--border-strong); }
+.snippet-type button.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.snippet-image-field { display: flex; flex-direction: column; gap: 8px; }
+.snippet-image-field small { font-size: 11.5px; color: var(--text-faint); }
+.snippet-image-preview { display: block; max-width: 100%; max-height: 240px; object-fit: contain; align-self: flex-start; border-radius: 6px; border: 1px solid var(--border); background: var(--bg-panel-alt); }
+.snippet-image-empty { padding: 24px; text-align: center; font-size: 12px; color: var(--text-faint); border: 1px dashed var(--border-strong); border-radius: 6px; }
+.snippet-image-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(64px, 1fr)); gap: 6px; max-height: 220px; overflow-y: auto; }
+.snippet-image-choice { aspect-ratio: 1; padding: 0; border: 2px solid transparent; border-radius: 6px; background: var(--bg-panel-alt); cursor: pointer; overflow: hidden; display: flex; align-items: center; justify-content: center; }
+.snippet-image-choice img { width: 100%; height: 100%; object-fit: cover; }
+.snippet-image-choice:hover { border-color: var(--border-strong); }
+.snippet-image-choice.on { border-color: var(--accent); }

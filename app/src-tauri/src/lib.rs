@@ -1,5 +1,7 @@
 mod clipboard;
 mod db;
+mod ocr;
+mod snippets;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 #[cfg(target_os = "macos")]
 use std::time::Instant;
-use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, WebviewWindow};
 
@@ -159,7 +161,8 @@ fn clear_non_favorites(app: tauri::AppHandle) {
     db::clear_non_favorites(&conn, &data_dir);
 }
 
-/// The "danger zone" action: removes absolutely everything, favorites included.
+/// The "danger zone" action: removes all clipboard history, favorites included.
+/// Snippets live in a separate database and are never touched by this.
 #[tauri::command]
 fn clear_history(app: tauri::AppHandle) {
     let data_dir = app.path().app_data_dir().expect("no app data dir");
@@ -465,7 +468,7 @@ fn payload_settle_delay(payload: &PreparedClipboardPayload) -> Duration {
 /// up front so we can return a clear, actionable error instead of a false
 /// "Pasted" success.
 #[cfg(target_os = "macos")]
-fn accessibility_trusted() -> bool {
+pub(crate) fn accessibility_trusted() -> bool {
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
         fn AXIsProcessTrusted() -> bool;
@@ -714,9 +717,34 @@ fn restore_history_after_paste_error(app: &tauri::AppHandle) {
     }
 }
 
+/// Synthesizes the paste keystroke from the right thread. Paste work runs on a
+/// blocking worker, but on macOS enigo resolves `Key::Unicode('v')` through the
+/// Text Input Sources API, which asserts it is on the main queue — calling it
+/// from the worker aborts the whole process (EXC_BREAKPOINT in
+/// `TSMGetInputSourceProperty`). Hop to the main thread and wait for the result.
+fn synth_paste_keystroke(app: &tauri::AppHandle) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let (sent, received) = std::sync::mpsc::sync_channel(1);
+        app.run_on_main_thread(move || {
+            let _ = sent.send(synth_paste_keystroke_on_current_thread());
+        })
+        .map_err(|e| format!("could not send the paste keystroke: {e}"))?;
+        return received
+            .recv_timeout(Duration::from_secs(2))
+            .map_err(|_| "timed out while sending the paste keystroke".to_string())?;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        synth_paste_keystroke_on_current_thread()
+    }
+}
+
 /// Synthesizes the platform paste keystroke (Cmd+V / Ctrl+V) into whatever
-/// application currently has OS focus.
-fn synth_paste_keystroke() -> Result<(), String> {
+/// application currently has OS focus. On macOS this must run on the main thread.
+fn synth_paste_keystroke_on_current_thread() -> Result<(), String> {
     use enigo::{Enigo, Keyboard, Settings};
     let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
     #[cfg(target_os = "macos")]
@@ -752,6 +780,17 @@ fn execute_paste(
     coordinator: Arc<PasteCoordinator>,
     ids: Vec<String>,
 ) -> Result<(), String> {
+    run_paste(app, monitor, coordinator, |conn, data_dir| {
+        prepare_paste_plan(conn, data_dir, &ids)
+    })
+}
+
+fn run_paste(
+    app: tauri::AppHandle,
+    monitor: Arc<MonitorState>,
+    coordinator: Arc<PasteCoordinator>,
+    build_plan: impl FnOnce(&rusqlite::Connection, &PathBuf) -> Result<PastePlan, String>,
+) -> Result<(), String> {
     let _operation_guard = coordinator
         .operation
         .lock()
@@ -761,7 +800,7 @@ fn execute_paste(
     let target_pid = snapshot_previous_paste_target(&coordinator)?;
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let conn = db::open(&data_dir);
-    let plan = prepare_paste_plan(&conn, &data_dir, &ids)?;
+    let plan = build_plan(&conn, &data_dir)?;
     // Permission preflight is intentionally before any clipboard mutation and
     // while the popup is still visible. When macOS denies it, stage a faithful
     // single-item/native-image payload so the action still has a manual Cmd+V
@@ -817,7 +856,7 @@ fn execute_paste(
                 restore_history_after_paste_error(&app);
                 return Err(error);
             }
-            if let Err(error) = synth_paste_keystroke() {
+            if let Err(error) = synth_paste_keystroke(&app) {
                 restore_history_after_paste_error(&app);
                 return Err(error);
             }
@@ -844,7 +883,7 @@ fn execute_paste(
             let mut current = first;
             let mut completed = 0usize;
             loop {
-                if let Err(error) = synth_paste_keystroke() {
+                if let Err(error) = synth_paste_keystroke(&app) {
                     restore_history_after_paste_error(&app);
                     return Err(if completed == 0 {
                         error
@@ -903,6 +942,76 @@ async fn paste_items_sequential(
     tauri::async_runtime::spawn_blocking(move || execute_paste(app, monitor, coordinator, ids))
         .await
         .map_err(|e| format!("paste worker failed: {e}"))?
+}
+
+/// Pastes a snippet's content into the previous app through the same
+/// focus-handoff path as a history item.
+#[tauri::command]
+async fn paste_snippet(
+    app: tauri::AppHandle,
+    monitor: tauri::State<'_, Arc<MonitorState>>,
+    coordinator: tauri::State<'_, Arc<PasteCoordinator>>,
+    id: String,
+) -> Result<(), String> {
+    let service = snippets::service(&app);
+    let snippet = service
+        .snippet(&id)
+        .ok_or_else(|| "that snippet no longer exists".to_string())?;
+    let payload = snippet_payload(&service, &snippet)?;
+    let monitor = monitor.inner().clone();
+    let coordinator = coordinator.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        run_paste(app, monitor, coordinator, |_, _| {
+            Ok(PastePlan::Sequential {
+                items: vec![PreparedSequentialItem {
+                    id: snippet.id.clone(),
+                    payload,
+                }],
+            })
+        })?;
+        service.record_use(&snippet.id);
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("paste worker failed: {e}"))?
+}
+
+/// Copies a snippet's content without adding a duplicate history entry.
+#[tauri::command]
+fn copy_snippet(
+    app: tauri::AppHandle,
+    monitor: tauri::State<Arc<MonitorState>>,
+    id: String,
+) -> Result<(), String> {
+    let service = snippets::service(&app);
+    let snippet = service
+        .snippet(&id)
+        .ok_or_else(|| "that snippet no longer exists".to_string())?;
+    let payload = snippet_payload(&service, &snippet)?;
+    let mut system_clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    write_prepared_payload(&mut system_clipboard, &monitor, &payload)
+}
+
+/// A snippet's text, or its image decoded for the clipboard.
+fn snippet_payload(
+    service: &snippets::SnippetService,
+    snippet: &snippets::store::Snippet,
+) -> Result<PreparedClipboardPayload, String> {
+    let Some(png) = service.image_png(snippet) else {
+        return Ok(PreparedClipboardPayload::Text {
+            hash: clipboard::hash_bytes(snippet.content.as_bytes()),
+            content: snippet.content.clone(),
+        });
+    };
+    let rgba = image::load_from_memory_with_format(&png?, image::ImageFormat::Png)
+        .map_err(|e| format!("the snippet's image is damaged: {e}"))?
+        .to_rgba8();
+    Ok(PreparedClipboardPayload::Image {
+        width: rgba.width() as usize,
+        height: rgba.height() as usize,
+        hash: clipboard::hash_bytes(rgba.as_raw()),
+        bytes: rgba.into_raw(),
+    })
 }
 
 #[tauri::command]
@@ -972,10 +1081,53 @@ fn save_annotated_image(app: tauri::AppHandle, id: String, data_url: String) -> 
     if !original_path.exists() && current_path.exists() {
         std::fs::copy(&current_path, &original_path).map_err(|e| e.to_string())?;
     }
-    std::fs::write(&current_path, &bytes).map_err(|e| e.to_string())?;
+    // Write-then-rename, so a crash mid-save can't leave a truncated image.
+    let pixels = image::load_from_memory(&bytes)
+        .map_err(|e| format!("the edited image is not valid: {e}"))?
+        .to_rgba8();
+    let temp_path = images_dir.join(format!("{id}.saving.png"));
+    std::fs::write(&temp_path, &bytes).map_err(|e| e.to_string())?;
+    std::fs::rename(&temp_path, &current_path).map_err(|e| e.to_string())?;
+    std::fs::remove_file(images_dir.join(db::thumbnail_file(&id))).ok();
     db::mark_edited(&conn, &id);
+    // Keep duplicate detection truthful: the item now holds the edited pixels,
+    // so re-copying the original image later creates a separate entry.
+    db::set_content_hash(&conn, &id, &clipboard::hash_bytes(pixels.as_raw()));
     let _ = app.emit("clipflow://item-updated", &id);
+    ocr::wake(&app);
     Ok(())
+}
+
+/// A small cached preview for the history list, so the list never decodes
+/// full-size screenshots. Regenerated when the source image is newer.
+#[tauri::command]
+fn get_thumbnail_data_url(app: tauri::AppHandle, id: String) -> Result<String, String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let conn = db::open(&data_dir);
+    let item = db::get_item(&conn, &id).ok_or_else(|| "item not found".to_string())?;
+    let images_dir = data_dir.join("images");
+    let source = images_dir.join(&item.content);
+    let thumb = images_dir.join(db::thumbnail_file(&id));
+    let modified = |p: &Path| p.metadata().and_then(|m| m.modified()).ok();
+    if modified(&thumb).is_none() || modified(&thumb) < modified(&source) {
+        let img = image::open(&source).map_err(|e| e.to_string())?;
+        img.thumbnail(160, 160)
+            .save(&thumb)
+            .map_err(|e| e.to_string())?;
+    }
+    let bytes = std::fs::read(&thumb).map_err(|e| e.to_string())?;
+    use base64::Engine;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:image/png;base64,{encoded}"))
+}
+
+/// Copies plain text (e.g. text recognized in a screenshot). It becomes a
+/// normal history entry, since the user is copying new content.
+#[tauri::command]
+fn copy_text(text: String) -> Result<(), String> {
+    arboard::Clipboard::new()
+        .and_then(|mut c| c.set_text(text))
+        .map_err(|e| e.to_string())
 }
 
 /// Copies one item straight to the system clipboard without hiding any window
@@ -1048,7 +1200,27 @@ pub fn run() {
             close_editor,
             save_annotated_image,
             copy_item_to_clipboard,
-            open_accessibility_settings
+            open_accessibility_settings,
+            paste_snippet,
+            copy_snippet,
+            snippets::snippets_list,
+            snippets::snippet_save,
+            snippets::snippet_delete,
+            snippets::snippet_set_enabled,
+            snippets::snippet_duplicate,
+            snippets::snippet_image_preview,
+            snippets::snippet_settings_get,
+            snippets::snippet_settings_set,
+            snippets::snippets_status,
+            snippets::snippets_pause,
+            snippets::snippets_resume,
+            get_thumbnail_data_url,
+            copy_text,
+            ocr::ocr_status,
+            ocr::ocr_set_enabled,
+            ocr::ocr_retry_failed,
+            ocr::ocr_set_language,
+            ocr::ocr_rescan
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -1058,6 +1230,11 @@ pub fn run() {
             app.set_activation_policy(tauri::ActivationPolicy::Accessory);
 
             let data_dir = app.path().app_data_dir().expect("no app data dir");
+            let snippet_service = snippets::SnippetService::new(handle.clone(), data_dir.clone());
+            app.manage(snippet_service.clone());
+            let ocr_service = ocr::OcrService::new(handle.clone(), data_dir.clone());
+            app.manage(ocr_service.clone());
+            ocr_service.start();
             clipboard::spawn_monitor(handle.clone(), data_dir, monitor.clone());
 
             // Tray icon + menu.
@@ -1084,6 +1261,37 @@ pub fn run() {
             let quit_item = MenuItem::with_id(app, "quit", "Quit Clipet", true, None::<&str>)?;
             let separator = PredefinedMenuItem::separator(app)?;
 
+            // Text expansion: a status line, a one-click pause/resume using the
+            // default duration, and explicit durations.
+            let expansion_status =
+                MenuItem::with_id(app, "snippets_status", "Text Expansion: On", false, None::<&str>)?;
+            let expansion_toggle = MenuItem::with_id(
+                app,
+                "snippets_toggle",
+                "Pause Text Expansion",
+                true,
+                None::<&str>,
+            )?;
+            let pause_for = Submenu::with_items(
+                app,
+                "Pause Text Expansion For",
+                true,
+                &[
+                    &MenuItem::with_id(app, "snippets_pause_5", "5 Minutes", true, None::<&str>)?,
+                    &MenuItem::with_id(app, "snippets_pause_15", "15 Minutes", true, None::<&str>)?,
+                    &MenuItem::with_id(app, "snippets_pause_30", "30 Minutes", true, None::<&str>)?,
+                    &MenuItem::with_id(app, "snippets_pause_60", "1 Hour", true, None::<&str>)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &MenuItem::with_id(
+                        app,
+                        "snippets_pause_indefinite",
+                        "Until I Resume",
+                        true,
+                        None::<&str>,
+                    )?,
+                ],
+            )?;
+
             let menu = Menu::with_items(
                 app,
                 &[
@@ -1094,12 +1302,16 @@ pub fn run() {
                     &settings_item,
                     &storage_item,
                     &separator,
+                    &expansion_status,
+                    &expansion_toggle,
+                    &pause_for,
+                    &separator,
                     &quit_item,
                 ],
             )?;
 
             let monitor_for_menu = monitor.clone();
-            let _tray = TrayIconBuilder::new()
+            let tray = TrayIconBuilder::new()
                 .icon(app.default_window_icon().unwrap().clone())
                 .menu(&menu)
                 .show_menu_on_left_click(true)
@@ -1121,10 +1333,55 @@ pub fn run() {
                         let _ = app.emit("clipflow://open-settings", ());
                         toggle_history_window(app);
                     }
+                    "snippets_toggle" => snippets::service(app).toggle_pause(),
+                    "snippets_pause_5" => snippets::service(app).pause_for(Some(5)),
+                    "snippets_pause_15" => snippets::service(app).pause_for(Some(15)),
+                    "snippets_pause_30" => snippets::service(app).pause_for(Some(30)),
+                    "snippets_pause_60" => snippets::service(app).pause_for(Some(60)),
+                    "snippets_pause_indefinite" => snippets::service(app).pause_for(None),
                     "quit" => app.exit(0),
                     _ => {}
                 })
                 .build(app)?;
+
+            let handle_for_status = handle.clone();
+            snippet_service.set_status_listener(move |status| {
+                use snippets::ListenerState;
+                let line = match (status.listener, status.enabled, status.paused, status.paused_until) {
+                    (ListenerState::Unsupported, ..) => "Text Expansion: Not available on this OS".to_string(),
+                    (ListenerState::NeedsPermission, ..) => "Text Expansion: Needs Accessibility".to_string(),
+                    (_, false, ..) => "Text Expansion: Off".to_string(),
+                    (_, _, true, Some(until)) => {
+                        let local = chrono::DateTime::from_timestamp_millis(until)
+                            .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())
+                            .unwrap_or_default();
+                        format!("Text Expansion: Paused until {local}")
+                    }
+                    (_, _, true, None) => "Text Expansion: Paused".to_string(),
+                    _ => "Text Expansion: On".to_string(),
+                };
+                let toggle_text = if status.paused {
+                    "Resume Text Expansion"
+                } else {
+                    "Pause Text Expansion"
+                };
+                let tooltip = if status.paused {
+                    "Clipet — text expansion paused"
+                } else {
+                    "Clipet — running in the background"
+                };
+                // Menu/tray setters block until the main thread runs them.
+                // Status changes can come from the keyboard-listener thread,
+                // which must never wait on the main thread, so queue instead.
+                let (status_item, toggle_item, tray) =
+                    (expansion_status.clone(), expansion_toggle.clone(), tray.clone());
+                let _ = handle_for_status.run_on_main_thread(move || {
+                    let _ = status_item.set_text(&line);
+                    let _ = toggle_item.set_text(toggle_text);
+                    let _ = tray.set_tooltip(Some(tooltip));
+                });
+            });
+            snippet_service.start(monitor.clone());
 
             // Global shortcut: ⌘⇧V on macOS, Ctrl+Shift+V elsewhere. (SUPER is
             // the Windows key on Windows — Win+Shift+V, next to the OS's own

@@ -41,8 +41,9 @@ html[data-window="editor"] body { font-family: -apple-system, "Segoe UI", sans-s
 .tool-btn:hover { background: var(--bg-hover); }
 .tool-btn.active { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
 
-#editor-canvas-wrap { flex: 1; display: flex; align-items: center; justify-content: center; position: relative; background: repeating-conic-gradient(var(--bg-panel-alt) 0% 25%, var(--bg-panel) 0% 50%) 50% / 20px 20px; overflow: auto; padding: 16px; }
-#editor-canvas { background: #fff; box-shadow: 0 2px 20px rgba(0,0,0,0.2); cursor: crosshair; max-width: 100%; max-height: 100%; }
+#editor-canvas-wrap { flex: 1; display: flex; position: relative; background: repeating-conic-gradient(var(--bg-panel-alt) 0% 25%, var(--bg-panel) 0% 50%) 50% / 20px 20px; overflow: auto; padding: 16px; }
+/* margin:auto centers the canvas yet keeps every edge reachable by scrolling when zoomed in (flex centering would clip the top/left). */
+#editor-canvas { background: #fff; box-shadow: 0 2px 20px rgba(0,0,0,0.2); cursor: crosshair; margin: auto; flex-shrink: 0; }
 
 #editor-sidebar { width: 190px; border-left: 1px solid var(--border); padding: 12px; background: var(--bg-panel-alt); font-size: 12px; color: var(--text-muted); overflow-y: auto; flex-shrink: 0; }
 #editor-sidebar label { display: block; margin: 10px 0 4px; font-size: 11px; color: var(--text-muted); }
@@ -65,3 +66,16 @@ html[data-window="editor"] body { font-family: -apple-system, "Segoe UI", sans-s
   opacity: 0; pointer-events: none; transition: all 160ms ease; z-index: 900;
 }
 #editor-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* The editor is a canvas tool, not a page: no text selection or image drag
+   except in real text fields. */
+#editor-shell { -webkit-user-select: none; user-select: none; cursor: default; }
+#editor-shell input[type="text"], #editor-shell textarea { -webkit-user-select: text; user-select: text; }
+#editor-shell img { -webkit-user-drag: none; }
+#editor-sidebar .section-title { font-size: 11px; font-weight: 600; color: var(--text-main); margin: 4px 0 2px; text-transform: uppercase; letter-spacing: 0.04em; }
+#editor-sidebar .hint { margin-top: 8px; font-size: 11px; line-height: 1.5; }
+#editor-zoom { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-muted); }
+#editor-zoom button { background: none; border: 1px solid var(--border-strong); border-radius: 6px; padding: 4px 8px; font-size: 12px; cursor: pointer; color: var(--text-main); min-width: 28px; }
+#editor-zoom button.on { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+#editor-zoom .pct { min-width: 44px; text-align: center; font-variant-numeric: tabular-nums; }
+#editor-canvas-wrap.panning, #editor-canvas-wrap.panning canvas { cursor: grab !important; }

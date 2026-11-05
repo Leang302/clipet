@@ -15,6 +15,45 @@ pub struct ClipItem {
     pub favorite: bool,
     pub pinned: bool,
     pub edited: bool,
+    /// One of the `OCR_*` states. Only meaningful for image items.
+    pub ocr_status: i64,
+    /// Text recognized in an image, for search.
+    pub ocr_text: Option<String>,
+    /// JSON array of recognized lines with normalized, top-left-origin boxes:
+    /// `[{"text": "...", "x": 0.1, "y": 0.2, "w": 0.3, "h": 0.04}, ...]`.
+    pub ocr_lines: Option<String>,
+    /// Why the last recognition attempt failed, in plain language.
+    pub ocr_error: Option<String>,
+}
+
+pub const OCR_PENDING: i64 = 0;
+pub const OCR_DONE: i64 = 1;
+pub const OCR_FAILED: i64 = 2;
+/// Set while an image is being recognized. Anything still in this state at
+/// startup crashed or was interrupted mid-OCR; it is marked failed so a bad
+/// image can't crash-loop the app.
+pub const OCR_RUNNING: i64 = 3;
+
+const ITEM_COLUMNS: &str = "id, kind, content, preview, source_app, created_at, last_used_at, use_count, favorite, pinned, edited, ocr_status, ocr_text, ocr_lines, ocr_error";
+
+fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipItem> {
+    Ok(ClipItem {
+        id: row.get(0)?,
+        kind: row.get(1)?,
+        content: row.get(2)?,
+        preview: row.get(3)?,
+        source_app: row.get(4)?,
+        created_at: row.get(5)?,
+        last_used_at: row.get(6)?,
+        use_count: row.get(7)?,
+        favorite: row.get::<_, i64>(8)? != 0,
+        pinned: row.get::<_, i64>(9)? != 0,
+        edited: row.get::<_, i64>(10)? != 0,
+        ocr_status: row.get(11)?,
+        ocr_text: row.get(12)?,
+        ocr_lines: row.get(13)?,
+        ocr_error: row.get(14)?,
+    })
 }
 
 pub fn open(data_dir: &PathBuf) -> Connection {
@@ -51,7 +90,212 @@ pub fn open(data_dir: &PathBuf) -> Connection {
         [],
     )
     .ok();
+    // OCR columns (same additive, idempotent pattern). Existing images start
+    // pending, so history captured before OCR existed gets indexed too.
+    for column in [
+        "ocr_status INTEGER NOT NULL DEFAULT 0",
+        "ocr_text TEXT",
+        "ocr_lines TEXT",
+        // Which OCR version produced ocr_text; older ones are re-scanned.
+        "ocr_version INTEGER NOT NULL DEFAULT 0",
+        "ocr_error TEXT",
+    ] {
+        conn.execute(&format!("ALTER TABLE clip_items ADD COLUMN {column}"), [])
+            .ok();
+    }
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_clip_items_ocr ON clip_items(ocr_status, kind)",
+        [],
+    )
+    .ok();
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+        [],
+    )
+    .ok();
     conn
+}
+
+pub fn get_setting(conn: &Connection, key: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM app_settings WHERE key = ?1",
+        params![key],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+pub fn set_setting(conn: &Connection, key: &str, value: &str) {
+    conn.execute(
+        "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )
+    .ok();
+}
+
+pub struct OcrJob {
+    pub id: String,
+    pub file: String,
+    /// Already indexed by an older OCR version (keeps its text meanwhile).
+    pub rescan: bool,
+}
+
+/// Next image to OCR: first-time scans (newest first) before re-scans of
+/// images indexed by an older `version`.
+pub fn next_ocr_job(conn: &Connection, version: i64) -> Option<OcrJob> {
+    let first = conn
+        .query_row(
+            "SELECT id, content FROM clip_items
+             WHERE kind IN ('image', 'screenshot') AND ocr_status = ?1
+             ORDER BY created_at DESC LIMIT 1",
+            params![OCR_PENDING],
+            |row| Ok(OcrJob { id: row.get(0)?, file: row.get(1)?, rescan: false }),
+        )
+        .ok();
+    first.or_else(|| {
+        conn.query_row(
+            "SELECT id, content FROM clip_items
+             WHERE kind IN ('image', 'screenshot') AND ocr_status = ?1 AND ocr_version < ?2
+             ORDER BY created_at DESC LIMIT 1",
+            params![OCR_DONE, version],
+            |row| Ok(OcrJob { id: row.get(0)?, file: row.get(1)?, rescan: true }),
+        )
+        .ok()
+    })
+}
+
+pub fn set_ocr_status(conn: &Connection, id: &str, status: i64) {
+    conn.execute(
+        "UPDATE clip_items SET ocr_status = ?1 WHERE id = ?2",
+        params![status, id],
+    )
+    .ok();
+}
+
+pub fn set_ocr_version(conn: &Connection, id: &str, version: i64) {
+    conn.execute(
+        "UPDATE clip_items SET ocr_version = ?1 WHERE id = ?2",
+        params![version, id],
+    )
+    .ok();
+}
+
+/// Stores a result. A row deleted while its OCR ran simply isn't updated.
+pub fn set_ocr_result(conn: &Connection, id: &str, text: &str, lines_json: &str, version: i64) -> bool {
+    conn.execute(
+        "UPDATE clip_items
+         SET ocr_status = ?1, ocr_text = ?2, ocr_lines = ?3, ocr_version = ?4, ocr_error = NULL
+         WHERE id = ?5",
+        params![OCR_DONE, text, lines_json, version, id],
+    )
+    .map(|n| n > 0)
+    .unwrap_or(false)
+}
+
+/// Records a failure. Text from an earlier successful scan is kept.
+pub fn set_ocr_failed(conn: &Connection, id: &str, error: &str, version: i64) {
+    conn.execute(
+        "UPDATE clip_items SET ocr_status = ?1, ocr_error = ?2, ocr_version = ?3 WHERE id = ?4",
+        params![OCR_FAILED, error, version, id],
+    )
+    .ok();
+}
+
+/// Puts one image at the front of the queue (keeps its current text).
+pub fn queue_ocr(conn: &Connection, id: &str) {
+    conn.execute(
+        "UPDATE clip_items SET ocr_status = ?1, ocr_error = NULL
+         WHERE id = ?2 AND kind IN ('image', 'screenshot')",
+        params![OCR_PENDING, id],
+    )
+    .ok();
+}
+
+/// After a settings change: re-scan everything in the background.
+pub fn mark_all_ocr_stale(conn: &Connection) {
+    conn.execute("UPDATE clip_items SET ocr_version = 0 WHERE ocr_status = ?1", params![OCR_DONE])
+        .ok();
+    requeue_failed_ocr(conn);
+}
+
+pub fn requeue_failed_ocr(conn: &Connection) {
+    conn.execute(
+        "UPDATE clip_items SET ocr_status = ?1, ocr_error = NULL WHERE ocr_status = ?2",
+        params![OCR_PENDING, OCR_FAILED],
+    )
+    .ok();
+}
+
+/// Startup recovery: an OCR interrupted by a crash or quit is not retried
+/// automatically (it may be what crashed); everything else resumes.
+pub fn fail_interrupted_ocr(conn: &Connection) {
+    conn.execute(
+        "UPDATE clip_items SET ocr_status = ?1, ocr_error = 'Reading was interrupted. Use Re-scan to try again.'
+         WHERE ocr_status = ?2",
+        params![OCR_FAILED, OCR_RUNNING],
+    )
+    .ok();
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct OcrCounts {
+    pub pending: i64,
+    pub stale: i64,
+    pub done: i64,
+    pub failed: i64,
+}
+
+pub fn ocr_counts(conn: &Connection, version: i64) -> OcrCounts {
+    conn.query_row(
+        "SELECT
+            COALESCE(SUM(ocr_status IN (?1, ?4)), 0),
+            COALESCE(SUM(ocr_status = ?2 AND ocr_version < ?5), 0),
+            COALESCE(SUM(ocr_status = ?2), 0),
+            COALESCE(SUM(ocr_status = ?3), 0)
+         FROM clip_items WHERE kind IN ('image', 'screenshot')",
+        params![OCR_PENDING, OCR_DONE, OCR_FAILED, OCR_RUNNING, version],
+        |row| Ok(OcrCounts { pending: row.get(0)?, stale: row.get(1)?, done: row.get(2)?, failed: row.get(3)? }),
+    )
+    .unwrap_or(OcrCounts { pending: 0, stale: 0, done: 0, failed: 0 })
+}
+
+/// An existing image with the same pixels: `(id, file name)`.
+pub fn find_image_by_hash(conn: &Connection, hash: &str) -> Option<(String, String)> {
+    conn.query_row(
+        "SELECT id, content FROM clip_items
+         WHERE content_hash = ?1 AND kind IN ('image', 'screenshot')
+         ORDER BY created_at DESC LIMIT 1",
+        params![hash],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .ok()
+}
+
+pub fn set_content_hash(conn: &Connection, id: &str, hash: &str) {
+    conn.execute(
+        "UPDATE clip_items SET content_hash = ?1 WHERE id = ?2",
+        params![hash, id],
+    )
+    .ok();
+}
+
+/// Moves an existing item to the top of history (a repeat copy).
+pub fn touch_item(conn: &Connection, id: &str, created_at: i64) {
+    conn.execute(
+        "UPDATE clip_items SET created_at = ?1 WHERE id = ?2",
+        params![created_at, id],
+    )
+    .ok();
+}
+
+/// Derived files that belong to an item besides its main content file.
+pub fn derived_image_files(id: &str) -> [String; 2] {
+    [format!("{id}.original.png"), thumbnail_file(id)]
+}
+
+pub fn thumbnail_file(id: &str) -> String {
+    format!("{id}.thumb.png")
 }
 
 pub fn insert_item(
@@ -91,59 +335,29 @@ pub fn most_recent_hash(conn: &Connection) -> Option<String> {
 
 pub fn list_items(conn: &Connection, limit: i64) -> Vec<ClipItem> {
     let mut stmt = conn
-        .prepare(
-            "SELECT id, kind, content, preview, source_app, created_at, last_used_at, use_count, favorite, pinned, edited
-             FROM clip_items ORDER BY created_at DESC LIMIT ?1",
-        )
+        .prepare(&format!(
+            "SELECT {ITEM_COLUMNS} FROM clip_items ORDER BY created_at DESC LIMIT ?1"
+        ))
         .unwrap();
-    let rows = stmt
-        .query_map(params![limit], |row| {
-            Ok(ClipItem {
-                id: row.get(0)?,
-                kind: row.get(1)?,
-                content: row.get(2)?,
-                preview: row.get(3)?,
-                source_app: row.get(4)?,
-                created_at: row.get(5)?,
-                last_used_at: row.get(6)?,
-                use_count: row.get(7)?,
-                favorite: row.get::<_, i64>(8)? != 0,
-                pinned: row.get::<_, i64>(9)? != 0,
-                edited: row.get::<_, i64>(10)? != 0,
-            })
-        })
-        .unwrap();
+    let rows = stmt.query_map(params![limit], row_to_item).unwrap();
     rows.filter_map(|r| r.ok()).collect()
 }
 
 pub fn get_item(conn: &Connection, id: &str) -> Option<ClipItem> {
     conn.query_row(
-        "SELECT id, kind, content, preview, source_app, created_at, last_used_at, use_count, favorite, pinned, edited
-         FROM clip_items WHERE id = ?1",
+        &format!("SELECT {ITEM_COLUMNS} FROM clip_items WHERE id = ?1"),
         params![id],
-        |row| {
-            Ok(ClipItem {
-                id: row.get(0)?,
-                kind: row.get(1)?,
-                content: row.get(2)?,
-                preview: row.get(3)?,
-                source_app: row.get(4)?,
-                created_at: row.get(5)?,
-                last_used_at: row.get(6)?,
-                use_count: row.get(7)?,
-                favorite: row.get::<_, i64>(8)? != 0,
-                pinned: row.get::<_, i64>(9)? != 0,
-                edited: row.get::<_, i64>(10)? != 0,
-            })
-        },
+        row_to_item,
     )
     .ok()
 }
 
+/// An annotation changed the pixels, so the image is queued for OCR again.
 pub fn mark_edited(conn: &Connection, id: &str) {
     conn.execute(
-        "UPDATE clip_items SET edited = 1 WHERE id = ?1",
-        params![id],
+        "UPDATE clip_items SET edited = 1, ocr_status = ?1, ocr_text = NULL, ocr_lines = NULL, ocr_error = NULL
+         WHERE id = ?2",
+        params![OCR_PENDING, id],
     )
     .ok();
 }
@@ -172,11 +386,17 @@ pub fn bump_usage(conn: &Connection, id: &str, used_at: i64) {
     .ok();
 }
 
+fn remove_image_files(images_dir: &std::path::Path, id: &str, content: &str) {
+    std::fs::remove_file(images_dir.join(content)).ok();
+    for derived in derived_image_files(id) {
+        std::fs::remove_file(images_dir.join(derived)).ok();
+    }
+}
+
 pub fn delete_item(conn: &Connection, data_dir: &PathBuf, id: &str) {
     if let Some(item) = get_item(conn, id) {
         if item.kind == "image" || item.kind == "screenshot" {
-            let path = data_dir.join("images").join(&item.content);
-            std::fs::remove_file(path).ok();
+            remove_image_files(&data_dir.join("images"), id, &item.content);
         }
     }
     conn.execute("DELETE FROM clip_items WHERE id = ?1", params![id])
@@ -193,14 +413,14 @@ pub fn clear_all(conn: &Connection, data_dir: &PathBuf) {
     }
 }
 
-/// The "Clear" action non-favorite items use day to day: deletes everything
-/// EXCEPT favorited items (and their backing image files, including any
-/// preserved `<id>.original.png`), so favorites survive a clear like most
-/// clipboard managers' users expect.
+/// The "Clear" action used day to day: deletes everything EXCEPT favorited
+/// and pinned items (and the deleted items' image files, including any
+/// preserved original and thumbnail). Snippets live in a separate database
+/// and are never touched.
 pub fn clear_non_favorites(conn: &Connection, data_dir: &PathBuf) {
     let images_dir = data_dir.join("images");
     let mut stmt = conn
-        .prepare("SELECT id, kind, content FROM clip_items WHERE favorite = 0")
+        .prepare("SELECT id, kind, content FROM clip_items WHERE favorite = 0 AND pinned = 0")
         .unwrap();
     let rows: Vec<(String, String, String)> = stmt
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
@@ -211,11 +431,10 @@ pub fn clear_non_favorites(conn: &Connection, data_dir: &PathBuf) {
 
     for (id, kind, content) in rows {
         if kind == "image" || kind == "screenshot" {
-            std::fs::remove_file(images_dir.join(&content)).ok();
-            std::fs::remove_file(images_dir.join(format!("{id}.original.png"))).ok();
+            remove_image_files(&images_dir, &id, &content);
         }
     }
-    conn.execute("DELETE FROM clip_items WHERE favorite = 0", [])
+    conn.execute("DELETE FROM clip_items WHERE favorite = 0 AND pinned = 0", [])
         .ok();
 }
 
