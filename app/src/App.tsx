@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import { applyTheme, loadTheme, saveTheme, THEME_STORAGE_KEY, type ThemeChoice } from "./theme";
 import { SnippetsView, type SnippetSeed } from "./Snippets";
 import { lineMatches, matchItem, type SearchMatch } from "./search";
+import { installPopupDrag } from "./popupDrag";
 import "./clipflow.css";
 
 type ClipItem = {
@@ -147,6 +148,8 @@ export default function App() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [activeId, setActiveId] = useState<string | null>(null);
   const [anchorId, setAnchorId] = useState<string | null>(null);
+  // Bumped each time the popup opens, after the list has reloaded.
+  const [openCount, setOpenCount] = useState(0);
   // Small list thumbnails and full-size preview images are cached separately:
   // the list never decodes full screenshots, only the previewed items do.
   const [imageUrls, setImageUrls] = useState<Record<string, string>>({});
@@ -172,6 +175,11 @@ export default function App() {
   useEffect(() => {
     applyTheme(theme);
   }, [theme]);
+
+  useEffect(() => {
+    const popup = document.getElementById("clip-popup");
+    return popup ? installPopupDrag(popup) : undefined;
+  }, []);
 
   // Picks up a theme change made from the editor window or a future settings
   // window, since each Tauri window is a separate document with its own copy
@@ -223,7 +231,7 @@ export default function App() {
 
     const unlistenNew = listen("clipflow://new-item", () => refresh());
     const unlistenOpen = listen("clipflow://history-opened", () => {
-      refresh();
+      refresh().then(() => setOpenCount((n) => n + 1));
       searchRef.current?.focus();
     });
     // An annotation was saved for this item — its file on disk changed, so the
@@ -296,6 +304,17 @@ export default function App() {
   const visible = searchResult.list;
 
   const visibleIds = visible.map((i) => i.id);
+  // Every open starts on the newest item (the first one shown), not wherever
+  // the previous visit left off.
+  useEffect(() => {
+    if (!openCount) return;
+    const first = visibleIds[0] ?? null;
+    setActiveId(first);
+    setAnchorId(first);
+    setSelectedIds(first ? new Set([first]) : new Set());
+    document.getElementById("item-list")?.scrollTo(0, 0);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [openCount]);
   useEffect(() => {
     if (!activeId || !visibleIds.includes(activeId)) {
       setActiveId(visibleIds[0] ?? null);

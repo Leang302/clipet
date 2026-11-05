@@ -52,3 +52,7 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+[features]
+# Live end-to-end paste checks (see src/e2e.rs). Never enabled for shipped builds.
+e2e = []

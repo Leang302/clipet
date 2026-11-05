@@ -54,9 +54,13 @@ function mockTauri(label) {
     { ...snip, id: "s1", name: "Name", keyword: "name", content: "KimLeang", content_type: "text" },
     { ...snip, id: "s2", name: "Logo", keyword: "logo", content: "snip-abc.png", content_type: "image" },
   ];
+  // Fires an app event at the page's listeners, like the backend would.
+  window.__emit = (event, payload = null) => calls
+    .filter((c) => c.cmd === "plugin:event|listen" && c.args.event === event)
+    .forEach((c) => window["__cb" + c.args.handler]?.({ event, id: 0, payload }));
   window.__TAURI_INTERNALS__ = {
     metadata: { currentWindow: { label }, currentWebview: { label } },
-    transformCallback: () => ++cb,
+    transformCallback: (fn) => { const id = ++cb; window["__cb" + id] = fn; return id; },
     convertFileSrc: (p) => p,
     invoke: async (cmd, args) => {
       calls.push({ cmd, args });
@@ -207,6 +211,37 @@ function mockTauri(label) {
     await page.click("text=🗑 Clear");
     check("Clear keeps favorites, pinned items and snippets", (await page.$$("text=/Favorites and pinned items .* your snippets are kept/")).length === 1);
     await page.keyboard.press("Escape");
+
+    // Dragging the popup: only its chrome moves the window.
+    const startsDrag = (selector, init = {}) => page.evaluate(([selector, init]) => {
+      const el = document.querySelector(selector);
+      if (!el) return "missing " + selector;
+      const before = window.__calls.filter((c) => c.cmd === "plugin:window|start_dragging").length;
+      const r = el.getBoundingClientRect();
+      el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, button: 0, detail: 1, clientX: r.left + 2, clientY: r.top + 2, ...init }));
+      return window.__calls.filter((c) => c.cmd === "plugin:window|start_dragging").length > before;
+    }, [selector, init]);
+    await page.waitForTimeout(50);
+    const dragCases = [
+      ["#sidebar", true], ["#search-row", true], ["#preview-header", true], ["#toolbar .hint-key", true],
+      [".sidebar-item", false], ["#search-input", false], [".clip-item", false], ["#sidebar select", false], ["#sidebar label", false],
+    ];
+    for (const [selector, expected] of dragCases) {
+      const got = await startsDrag(selector);
+      check(`pressing ${selector} ${expected ? "drags" : "does not drag"} the popup`, got === expected, String(got));
+    }
+    check("modifier presses never drag the popup", (await startsDrag("#sidebar", { shiftKey: true })) === false);
+    check("double-clicks on the chrome don't drag or zoom", (await startsDrag("#sidebar", { detail: 2 })) === false);
+    await page.locator(".clip-item").nth(0).click();
+    check("items still select after drag attempts", (await selectedIds()).length === 1);
+
+    // Reopening the popup starts on the first item, not where it was left.
+    await page.locator(".clip-item").nth(2).click();
+    await page.evaluate(() => window.__emit("clipflow://history-opened"));
+    await page.waitForTimeout(150);
+    const firstTitle = await page.locator(".clip-item").first().locator(".clip-title").textContent();
+    const afterOpen = await selectedIds();
+    check("opening the popup selects the first item", afterOpen.length === 1 && afterOpen[0] === firstTitle, JSON.stringify(afterOpen));
 
     // Preview text stays copyable on purpose.
     await page.locator(".clip-item", { hasText: "https://" }).click();

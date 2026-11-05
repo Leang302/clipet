@@ -5,6 +5,7 @@
   "windows": ["history", "editor"],
   "permissions": [
     "core:default",
+    "core:window:allow-start-dragging",
     "opener:default",
     "global-shortcut:default",
     "autostart:default"

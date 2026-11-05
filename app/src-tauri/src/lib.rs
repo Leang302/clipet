@@ -1,14 +1,16 @@
 mod clipboard;
 mod db;
+#[cfg(all(feature = "e2e", target_os = "macos"))]
+mod e2e;
 mod ocr;
+#[cfg(target_os = "macos")]
+mod paste_target;
 mod snippets;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
-#[cfg(target_os = "macos")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager, WebviewWindow};
@@ -37,7 +39,19 @@ struct EditorSession {
 struct PasteCoordinator {
     operation: Mutex<()>,
     #[cfg(target_os = "macos")]
-    previous_target_pid: Mutex<Option<i32>>,
+    previous_target: Mutex<PasteTarget>,
+}
+
+/// Where a paste goes: the app that was frontmost when the popup opened and,
+/// on macOS, its focused window (see `paste_target`).
+#[derive(Clone, Default)]
+struct PasteTarget {
+    pid: Option<i32>,
+    #[cfg(target_os = "macos")]
+    window: Option<paste_target::WindowRef>,
+    /// The text field that had focus, when the app exposes it.
+    #[cfg(target_os = "macos")]
+    element: Option<paste_target::ElementRef>,
 }
 
 enum PreparedClipboardPayload {
@@ -602,25 +616,35 @@ fn capture_previous_paste_target(coordinator: &PasteCoordinator) {
         // window) must not erase the still-valid external destination.
         return;
     };
-    if let Ok(mut stored) = coordinator.previous_target_pid.lock() {
-        *stored = Some(target_pid);
+    let window = paste_target::focused_window(target_pid);
+    let element = paste_target::focused_element(target_pid);
+    snippets::diag(&format!(
+        "paste: popup opened over pid {target_pid} ({})",
+        paste_target::describe_focus(target_pid, window.as_ref())
+    ));
+    if let Ok(mut stored) = coordinator.previous_target.lock() {
+        *stored = PasteTarget {
+            pid: Some(target_pid),
+            window,
+            element,
+        };
     }
 }
 
-fn snapshot_previous_paste_target(coordinator: &PasteCoordinator) -> Result<Option<i32>, String> {
+fn snapshot_previous_paste_target(coordinator: &PasteCoordinator) -> Result<PasteTarget, String> {
     #[cfg(target_os = "macos")]
     {
         return coordinator
-            .previous_target_pid
+            .previous_target
             .lock()
-            .map(|target| *target)
+            .map(|target| target.clone())
             .map_err(|_| "paste target state is unavailable".to_string());
     }
 
     #[cfg(not(target_os = "macos"))]
     {
         let _ = coordinator;
-        Ok(None)
+        Ok(PasteTarget::default())
     }
 }
 
@@ -652,8 +676,9 @@ fn focus_handoff_complete(
 
 fn return_focus_to_previous_app(
     app: &tauri::AppHandle,
-    target_pid: Option<i32>,
+    paste_target: &PasteTarget,
 ) -> Result<(), String> {
+    let target_pid = paste_target.pid;
     if let Some(win) = app.get_webview_window("history") {
         let _ = win.hide();
     }
@@ -662,11 +687,13 @@ fn return_focus_to_previous_app(
     {
         use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
 
+        let started = Instant::now();
         app.hide()
             .map_err(|e| format!("could not hide Clipet: {e}"))?;
         // AppHandle::hide queues work on Tauri's event loop. This barrier is
         // reached after that message without blocking the event-loop thread.
         wait_for_hide_dispatch(app)?;
+        snippets::diag(&format!("paste: Clipet hidden after {}ms", started.elapsed().as_millis()));
 
         let current_pid = std::process::id() as i32;
         let target =
@@ -688,10 +715,36 @@ fn return_focus_to_previous_app(
                     .filter(|application| !application.isTerminated())
                     .map(|application| application.processIdentifier());
                 if focus_handoff_complete(frontmost_pid, current_pid, effective_target_pid) {
+                    snippets::diag(&format!(
+                        "paste: pid {frontmost_pid} frontmost after {}ms",
+                        started.elapsed().as_millis()
+                    ));
+                    // The app is frontmost; make sure the window the user
+                    // came from (e.g. a Chrome pop-up) has focus too.
+                    if let (Some(pid), Some(window)) = (effective_target_pid, &paste_target.window) {
+                        let handoff =
+                            paste_target::refocus(pid, window, Duration::from_millis(400));
+                        snippets::diag(&format!("paste: window handoff {handoff:?}"));
+                        if handoff == paste_target::Handoff::Raised {
+                            // Let the app move keyboard focus into the window's
+                            // text field before ⌘V arrives.
+                            std::thread::sleep(Duration::from_millis(40));
+                        }
+                    }
+                    if let (Some(pid), Some(element)) = (effective_target_pid, &paste_target.element) {
+                        let handoff =
+                            paste_target::refocus_element(pid, element, Duration::from_millis(300));
+                        snippets::diag(&format!("paste: text field handoff {handoff:?}"));
+                    }
+                    snippets::diag(&format!(
+                        "paste: before ⌘V: {}",
+                        paste_target::describe_focus(frontmost_pid, paste_target.window.as_ref())
+                    ));
                     return Ok(());
                 }
             }
             if Instant::now() >= deadline {
+                snippets::diag("paste: previous app never became frontmost; nothing pasted");
                 return Err("the previous app did not regain focus; nothing was pasted".to_string());
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -718,8 +771,8 @@ fn restore_history_after_paste_error(app: &tauri::AppHandle) {
 }
 
 /// Synthesizes the paste keystroke from the right thread. Paste work runs on a
-/// blocking worker, but on macOS enigo resolves `Key::Unicode('v')` through the
-/// Text Input Sources API, which asserts it is on the main queue — calling it
+/// blocking worker, but on macOS the V key code is looked up through the Text
+/// Input Sources API (`paste_target::paste_key_code`), which asserts it is on the main queue — calling it
 /// from the worker aborts the whole process (EXC_BREAKPOINT in
 /// `TSMGetInputSourceProperty`). Hop to the main thread and wait for the result.
 fn synth_paste_keystroke(app: &tauri::AppHandle) -> Result<(), String> {
@@ -727,7 +780,12 @@ fn synth_paste_keystroke(app: &tauri::AppHandle) -> Result<(), String> {
     {
         let (sent, received) = std::sync::mpsc::sync_channel(1);
         app.run_on_main_thread(move || {
-            let _ = sent.send(synth_paste_keystroke_on_current_thread());
+            let result = synth_paste_keystroke_on_current_thread();
+            snippets::diag(&match &result {
+                Ok(()) => "paste: ⌘V sent".to_string(),
+                Err(e) => format!("paste: ⌘V failed: {e}"),
+            });
+            let _ = sent.send(result);
         })
         .map_err(|e| format!("could not send the paste keystroke: {e}"))?;
         return received
@@ -742,14 +800,30 @@ fn synth_paste_keystroke(app: &tauri::AppHandle) -> Result<(), String> {
     }
 }
 
+/// The V of ⌘V / Ctrl+V as a fixed key code, never looked up by character on
+/// the current layout: with a non-Latin layout (e.g. Khmer) no key types "v"
+/// and the lookup fell back to the A key, sending Select All instead of paste.
+/// (macOS posts its own chord, see `paste_target::post_paste_chord`.)
+#[cfg(not(target_os = "macos"))]
+fn paste_key() -> enigo::Key {
+    // Windows virtual-key codes for letters don't depend on the layout.
+    #[cfg(target_os = "windows")]
+    return enigo::Key::Other(0x56); // VK_V
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    return enigo::Key::Unicode('v');
+}
+
 /// Synthesizes the platform paste keystroke (Cmd+V / Ctrl+V) into whatever
 /// application currently has OS focus. On macOS this must run on the main thread.
+#[cfg(target_os = "macos")]
+fn synth_paste_keystroke_on_current_thread() -> Result<(), String> {
+    paste_target::post_paste_chord(0)
+}
+
+#[cfg(not(target_os = "macos"))]
 fn synth_paste_keystroke_on_current_thread() -> Result<(), String> {
     use enigo::{Enigo, Keyboard, Settings};
     let mut enigo = Enigo::new(&Settings::default()).map_err(|e| e.to_string())?;
-    #[cfg(target_os = "macos")]
-    let modifier = enigo::Key::Meta;
-    #[cfg(not(target_os = "macos"))]
     let modifier = enigo::Key::Control;
 
     let pressed = enigo.key(modifier, enigo::Direction::Press);
@@ -760,7 +834,7 @@ fn synth_paste_keystroke_on_current_thread() -> Result<(), String> {
         return Err(error.to_string());
     }
 
-    let pasted = enigo.key(enigo::Key::Unicode('v'), enigo::Direction::Click);
+    let pasted = enigo.key(paste_key(), enigo::Direction::Click);
     let released = enigo.key(modifier, enigo::Direction::Release);
     match (pasted, released) {
         (Ok(()), Ok(())) => Ok(()),
@@ -797,7 +871,7 @@ fn run_paste(
         .map_err(|_| "another paste operation ended unexpectedly".to_string())?;
     // Freeze the destination for this operation. Opening/toggling another popup
     // while large images are being preloaded cannot redirect an in-flight paste.
-    let target_pid = snapshot_previous_paste_target(&coordinator)?;
+    let target = snapshot_previous_paste_target(&coordinator)?;
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     let conn = db::open(&data_dir);
     let plan = build_plan(&conn, &data_dir)?;
@@ -852,7 +926,7 @@ fn run_paste(
                 }
             }
 
-            if let Err(error) = return_focus_to_previous_app(&app, target_pid) {
+            if let Err(error) = return_focus_to_previous_app(&app, &target) {
                 restore_history_after_paste_error(&app);
                 return Err(error);
             }
@@ -875,7 +949,7 @@ fn run_paste(
                 .next()
                 .ok_or_else(|| "no items selected".to_string())?;
             write_prepared_payload(&mut system_clipboard, &monitor, &first.payload)?;
-            if let Err(error) = return_focus_to_previous_app(&app, target_pid) {
+            if let Err(error) = return_focus_to_previous_app(&app, &target) {
                 restore_history_after_paste_error(&app);
                 return Err(error);
             }
@@ -1146,6 +1220,75 @@ fn copy_item_to_clipboard(
     write_item_to_clipboard(&data_dir, &monitor, &item)
 }
 
+/// One axis of `keep_on_screen`: the window's start moved just enough to fit
+/// inside `[area_start, area_start + area_len)`, or pinned to the start when
+/// the window is larger than the area.
+fn clamp_axis(start: i32, len: u32, area_start: i32, area_len: u32) -> i32 {
+    let max = area_start + area_len as i32 - len as i32;
+    if max < area_start {
+        area_start
+    } else {
+        start.clamp(area_start, max)
+    }
+}
+
+/// Keeps the popup inside the visible area (minus menu bar and Dock / taskbar)
+/// of the screen it is mostly on, or the primary screen when it is on none.
+fn keep_on_screen(win: &tauri::WebviewWindow) {
+    let (Ok(position), Ok(size)) = (win.outer_position(), win.outer_size()) else {
+        return;
+    };
+    let monitor = match win.current_monitor() {
+        Ok(Some(monitor)) => monitor,
+        _ => match win.primary_monitor() {
+            Ok(Some(monitor)) => monitor,
+            _ => return,
+        },
+    };
+    let area = monitor.work_area();
+    let x = clamp_axis(position.x, size.width, area.position.x, area.size.width);
+    let y = clamp_axis(position.y, size.height, area.position.y, area.size.height);
+    if (x, y) != (position.x, position.y) {
+        let _ = win.set_position(tauri::PhysicalPosition::new(x, y));
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn mouse_button_down() -> bool {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
+    }
+    // Combined session state, left button.
+    unsafe { CGEventSourceButtonState(0, 0) }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mouse_button_down() -> bool {
+    false
+}
+
+/// Called for every move event. Once the window has stopped moving and the
+/// mouse is released, pulls it back on screen — never mid-drag, which would
+/// fight the user's hand.
+fn keep_on_screen_after_move(win: &tauri::WebviewWindow, last_move: &Arc<Mutex<Instant>>, settling: &Arc<AtomicBool>) {
+    *last_move.lock().unwrap() = Instant::now();
+    if settling.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let (win, last_move, settling) = (win.clone(), last_move.clone(), settling.clone());
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(Duration::from_millis(120));
+            if last_move.lock().unwrap().elapsed() >= Duration::from_millis(250) && !mouse_button_down() {
+                break;
+            }
+        }
+        settling.store(false, Ordering::SeqCst);
+        keep_on_screen(&win);
+    });
+}
+
 fn toggle_history_window(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("history") {
         let visible = win.is_visible().unwrap_or(false);
@@ -1159,6 +1302,8 @@ fn toggle_history_window(app: &tauri::AppHandle) {
             #[cfg(target_os = "macos")]
             let _ = app.show();
             let _ = win.show();
+            // Its screen may have been disconnected since it was moved there.
+            keep_on_screen(&win);
             let _ = win.set_focus();
             let _ = app.emit("clipflow://history-opened", ());
         }
@@ -1236,6 +1381,12 @@ pub fn run() {
             app.manage(ocr_service.clone());
             ocr_service.start();
             clipboard::spawn_monitor(handle.clone(), data_dir, monitor.clone());
+            #[cfg(all(feature = "e2e", target_os = "macos"))]
+            e2e::start(
+                handle.clone(),
+                monitor.clone(),
+                app.state::<Arc<PasteCoordinator>>().inner().clone(),
+            );
 
             // Tray icon + menu.
             let open_item = MenuItem::with_id(
@@ -1409,10 +1560,17 @@ pub fn run() {
             // needed here for our own editor taking focus.)
             if let Some(win) = app.get_webview_window("history") {
                 let win_clone = win.clone();
-                win.on_window_event(move |event| {
-                    if let tauri::WindowEvent::Focused(false) = event {
+                let last_move = Arc::new(Mutex::new(Instant::now()));
+                let settling = Arc::new(AtomicBool::new(false));
+                win.on_window_event(move |event| match event {
+                    tauri::WindowEvent::Focused(false) => {
                         let _ = win_clone.hide();
                     }
+                    // Dragged by its chrome (see popupDrag.ts).
+                    tauri::WindowEvent::Moved(_) => {
+                        keep_on_screen_after_move(&win_clone, &last_move, &settling)
+                    }
+                    _ => {}
                 });
             }
 
@@ -1608,6 +1766,14 @@ mod paste_tests {
     #[test]
     fn focus_handoff_uses_any_external_app_when_target_is_unavailable() {
         assert!(focus_handoff_complete(200, 100, None));
+        // Popup placement: fits → unchanged; past an edge → pulled in;
+        // larger than the screen → pinned to its start.
+        assert_eq!(clamp_axis(100, 800, 0, 1512), 100);
+        assert_eq!(clamp_axis(1200, 800, 0, 1512), 712);
+        assert_eq!(clamp_axis(-300, 800, 0, 1512), 0);
+        assert_eq!(clamp_axis(-1800, 800, -1920, 1920), -1800);
+        assert_eq!(clamp_axis(-100, 800, -1920, 1920), -800);
+        assert_eq!(clamp_axis(50, 2000, 25, 957), 25);
         assert!(!focus_handoff_complete(100, 100, None));
         assert!(focus_handoff_complete(300, 100, Some(300)));
         assert!(!focus_handoff_complete(200, 100, Some(300)));

@@ -561,9 +561,11 @@ fn replace_on_main(
             let _ = enigo.text(text);
         }
         None => {
-            let _ = enigo.key(Key::Meta, Direction::Press);
-            let _ = enigo.key(Key::Unicode('v'), Direction::Click);
-            let _ = enigo.key(Key::Meta, Direction::Release);
+            // Explicit ⌘ flags and a layout-independent V key; see
+            // `paste_target::post_paste_chord`.
+            if let Err(e) = crate::paste_target::post_paste_chord(SYNTHETIC_MARK) {
+                super::diag(&format!("paste keystroke failed: {e}"));
+            }
         }
     }
     Outcome::Done { restore }
