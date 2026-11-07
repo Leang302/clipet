@@ -736,25 +736,47 @@ export default function Editor() {
     setSelectedId(null); // selection never carries across images in a batch
   }, [index]);
 
-  async function handleDone() {
+  /**
+   * "new" (default): edited images become new history items; originals stay
+   * untouched. "replace": overwrite the originals. "paste": save as new,
+   * then paste the results into the app the popup was opened over.
+   */
+  async function handleDone(mode: "new" | "replace" | "paste" = "new") {
+    const results: string[] = [];
     let savedCount = 0;
     for (const id of targets) {
-      if (isDirty(id)) {
-        const dataUrl = await flattenToDataUrl(id);
-        try {
+      if (!isDirty(id)) {
+        results.push(id);
+        continue;
+      }
+      const dataUrl = await flattenToDataUrl(id);
+      try {
+        if (mode === "replace") {
           await invoke("save_annotated_image", { id, dataUrl });
-          savedCount++;
-        } catch (e) {
-          toast(`Failed to save: ${e}`);
-          return;
+          results.push(id);
+        } else {
+          results.push(await invoke<string>("save_annotated_image_as_new", { id, dataUrl }));
         }
+        savedCount++;
+      } catch (e) {
+        toast(`Failed to save: ${e}`);
+        return;
       }
     }
+    imgStates.current = {};
+    if (mode === "paste") {
+      try {
+        await invoke("paste_after_edit", { ids: results });
+      } catch (e) {
+        toast(`Saved, but the paste failed: ${e}`);
+      }
+      return;
+    }
     if (savedCount === 1 && targets.length === 1) {
-      await invoke("copy_item_to_clipboard", { id: targets[0] }).catch(() => {});
+      // Ready for ⌘V straight away.
+      await invoke("copy_item_to_clipboard", { id: results[0] }).catch(() => {});
     }
     await invoke("close_editor");
-    imgStates.current = {};
   }
 
   async function discardAndClose() {
@@ -836,7 +858,7 @@ export default function Editor() {
         if (selectedId) setSelectedId(null); // first Esc just deselects
         else handleCancel();
       }
-      else if (e.key === "Enter") { e.preventDefault(); handleDone(); }
+      else if (e.key === "Enter") { e.preventDefault(); handleDone("new"); }
     }
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
@@ -948,7 +970,9 @@ export default function Editor() {
           <button className={zoom === 1 ? "on" : ""} title="Actual size (⌘1)" onClick={() => setZoom(1)}>100%</button>
         </div>
         <button className="ghost" onClick={handleCancel}>Cancel</button>
-        <button className="primary" onClick={handleDone}>Done</button>
+        <button className="ghost" title="Overwrite the original image with your changes" onClick={() => handleDone("replace")}>Replace Original</button>
+        <button className="ghost" title="Save as a new item and paste it into the app you came from" onClick={() => handleDone("paste")}>Save &amp; Paste</button>
+        <button className="primary" title="Save as a new history item; the original stays unchanged (Enter)" onClick={() => handleDone("new")}>Save as New</button>
       </div>
       <div id="editor-main">
         <div id="editor-tools">

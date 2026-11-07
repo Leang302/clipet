@@ -119,7 +119,8 @@ pub enum Decision {
     /// Let the key through untouched.
     Pass,
     /// Swallow the trigger key, erase `delete_chars` characters, then insert
-    /// `insert` (which already includes the trailing space for Space).
+    /// `insert`: the snippet exactly as saved, plus its own whitespace setting
+    /// (folded into the indexed content). The trigger key is never inserted.
     Expand {
         snippet_id: String,
         delete_chars: usize,
@@ -300,7 +301,7 @@ impl Engine {
             Some(snippet) => Decision::Expand {
                 snippet_id: snippet.id.clone(),
                 delete_chars: word_chars,
-                insert: format!("{}{trailing}", snippet.content),
+                insert: snippet.content.clone(),
             },
             None => Decision::Pass,
         }
@@ -386,14 +387,40 @@ mod tests {
     }
 
     #[test]
-    fn space_expands_with_one_trailing_space() {
+    fn space_trigger_is_not_inserted() {
         let decision = run("Hello ;name", TriggerKey::Space, &EngineConfig::default());
         assert_eq!(
             decision,
             Decision::Expand {
                 snippet_id: "s-name".into(),
                 delete_chars: 5,
-                insert: "KimLeang ".into()
+                insert: "KimLeang".into()
+            }
+        );
+    }
+
+    #[test]
+    fn saved_whitespace_is_inserted_exactly() {
+        let idx = SnippetIndex::new(
+            [(
+                "pad",
+                IndexedSnippet {
+                    id: "s-pad".into(),
+                    content: "  Hello World \n".into(),
+                    image: false,
+                },
+            )],
+            true,
+        );
+        let config = EngineConfig::default();
+        let mut engine = Engine::new();
+        type_word(&mut engine, ";pad", &config, &idx);
+        assert_eq!(
+            engine.feed(KeyInput::Trigger(TriggerKey::Space), &config, &idx),
+            Decision::Expand {
+                snippet_id: "s-pad".into(),
+                delete_chars: 4,
+                insert: "  Hello World \n".into()
             }
         );
     }
@@ -574,8 +601,8 @@ mod tests {
         assert!(engine
             .feed(KeyInput::Trigger(TriggerKey::Space), &config, &idx)
             .swallows_trigger());
-        // "Hi KimLeang " → delete "KimLeang " → "Hi " → retype.
-        for _ in 0.."KimLeang ".len() {
+        // "Hi KimLeang" → delete "KimLeang" → "Hi " → retype.
+        for _ in 0.."KimLeang".len() {
             engine.feed(KeyInput::Backspace, &config, &idx);
         }
         type_word(&mut engine, ";name", &config, &idx);
@@ -598,7 +625,9 @@ mod tests {
         assert!(engine
             .feed(KeyInput::Trigger(TriggerKey::Space), &config, &idx)
             .swallows_trigger());
-        // With known whitespace before it, no verification is needed.
+        // With known whitespace before it, no verification is needed. (Exact
+        // insertion adds no space, so the person types one.)
+        engine.feed(KeyInput::Trigger(TriggerKey::Space), &config, &idx);
         type_word(&mut engine, ";name", &config, &idx);
         assert!(!engine.word_starts_line());
     }
@@ -693,7 +722,7 @@ mod tests {
             Decision::Expand {
                 snippet_id: "s-sig".into(),
                 delete_chars: 4,
-                insert: "Best,\nKim ".into()
+                insert: "Best,\nKim".into()
             }
         );
     }

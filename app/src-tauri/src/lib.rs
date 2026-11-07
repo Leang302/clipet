@@ -5,6 +5,7 @@ mod e2e;
 mod ocr;
 #[cfg(target_os = "macos")]
 mod paste_target;
+mod retention;
 mod snippets;
 
 use std::path::{Path, PathBuf};
@@ -63,6 +64,11 @@ enum PreparedClipboardPayload {
         width: usize,
         height: usize,
         bytes: Vec<u8>,
+        hash: String,
+    },
+    /// Native file references (Finder / Explorer), never file contents.
+    Files {
+        paths: Vec<PathBuf>,
         hash: String,
     },
 }
@@ -132,7 +138,55 @@ fn get_paused(monitor: tauri::State<Arc<MonitorState>>) -> bool {
 
 #[tauri::command]
 fn set_paused(monitor: tauri::State<Arc<MonitorState>>, paused: bool) {
+    monitor.paused_until.store(0, Ordering::Relaxed);
     monitor.paused.store(paused, Ordering::Relaxed);
+}
+
+#[derive(serde::Serialize)]
+struct MonitoringStatus {
+    paused: bool,
+    /// Epoch ms when recording resumes on its own; None = until resumed.
+    until: Option<i64>,
+}
+
+fn monitoring_status_of(monitor: &MonitorState) -> MonitoringStatus {
+    let until = monitor.paused_until.load(Ordering::Relaxed);
+    let paused = monitor.paused.load(Ordering::Relaxed)
+        && (until == 0 || chrono::Utc::now().timestamp_millis() < until);
+    MonitoringStatus { paused, until: (paused && until > 0).then_some(until) }
+}
+
+#[tauri::command]
+fn monitoring_status(monitor: tauri::State<Arc<MonitorState>>) -> MonitoringStatus {
+    monitoring_status_of(&monitor)
+}
+
+/// Stops recording copies for `minutes` (None = until resumed), e.g. while
+/// handling passwords that don't mark themselves private.
+#[tauri::command]
+fn pause_monitoring(monitor: tauri::State<Arc<MonitorState>>, minutes: Option<u32>) -> MonitoringStatus {
+    let until = minutes.map(|m| chrono::Utc::now().timestamp_millis() + i64::from(m.clamp(1, 24 * 60)) * 60_000);
+    monitor.paused_until.store(until.unwrap_or(0), Ordering::Relaxed);
+    monitor.paused.store(true, Ordering::Relaxed);
+    monitoring_status_of(&monitor)
+}
+
+/// Saves edited text back into a text/code/link item (the full viewer's Edit).
+#[tauri::command]
+fn update_item_text(app: tauri::AppHandle, id: String, content: String) -> Result<(), String> {
+    if content.is_empty() {
+        return Err("the text can't be empty".to_string());
+    }
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let conn = db::open(&data_dir);
+    let item = db::get_item(&conn, &id).ok_or_else(|| "that item no longer exists".to_string())?;
+    if !matches!(item.kind.as_str(), "text" | "code" | "link") {
+        return Err("only text items can be edited".to_string());
+    }
+    let preview: String = content.chars().take(120).collect();
+    db::update_text(&conn, &id, &content, &preview, &clipboard::hash_bytes(content.as_bytes()))?;
+    let _ = app.emit("clipflow://item-updated", &id);
+    Ok(())
 }
 
 #[tauri::command]
@@ -214,6 +268,133 @@ fn write_item_to_clipboard(
         *monitor.last_self_write_hash.lock().unwrap() = Some(hash);
     }
     Ok(())
+}
+
+/// The paths a file item refers to, in the order they were copied.
+fn file_item_paths(item: &db::ClipItem) -> Vec<PathBuf> {
+    serde_json::from_str::<Vec<String>>(&item.content)
+        .map(|paths| paths.into_iter().map(PathBuf::from).collect())
+        .unwrap_or_default()
+}
+
+/// A file item's paths, failing with a clear message when any of them is no
+/// longer there — pasting only some of the files would be worse than none.
+fn available_file_paths(item: &db::ClipItem) -> Result<Vec<PathBuf>, String> {
+    let paths = file_item_paths(item);
+    if paths.is_empty() {
+        return Err("this entry has no file paths".to_string());
+    }
+    if let Some(missing) = paths.iter().find(|p| std::fs::symlink_metadata(p).is_err() || !p.exists()) {
+        return Err(format!(
+            "\"{}\" is no longer at {}. It may have been moved, renamed or deleted, or its drive is disconnected. Nothing was pasted.",
+            missing.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+            missing.display()
+        ));
+    }
+    Ok(paths)
+}
+
+#[derive(serde::Serialize)]
+struct FileEntry {
+    name: String,
+    path: String,
+    /// `file://` URL with spaces and non-ASCII characters percent-encoded.
+    url: Option<String>,
+    exists: bool,
+    /// Present but unreadable (permissions).
+    accessible: bool,
+    is_dir: bool,
+    is_symlink: bool,
+    size: Option<u64>,
+    modified: Option<i64>,
+    extension: String,
+}
+
+fn file_entry(path: &Path) -> FileEntry {
+    let link = std::fs::symlink_metadata(path).ok();
+    let target = std::fs::metadata(path);
+    let accessible = match &target {
+        Ok(meta) if meta.is_dir() => std::fs::read_dir(path).is_ok(),
+        Ok(_) => std::fs::File::open(path).is_ok(),
+        Err(_) => false,
+    };
+    let meta = target.ok();
+    FileEntry {
+        name: path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.to_string_lossy().into_owned()),
+        path: path.to_string_lossy().into_owned(),
+        url: tauri::Url::from_file_path(path).ok().map(|u| u.to_string()),
+        exists: meta.is_some(),
+        accessible,
+        is_dir: meta.as_ref().is_some_and(|m| m.is_dir()),
+        is_symlink: link.is_some_and(|m| m.file_type().is_symlink()),
+        size: meta.as_ref().filter(|m| m.is_file()).map(|m| m.len()),
+        modified: meta
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as i64),
+        extension: path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default(),
+    }
+}
+
+fn file_item(app: &tauri::AppHandle, id: &str) -> Result<db::ClipItem, String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    db::get_item(&db::open(&data_dir), id)
+        .filter(|item| item.kind == "file")
+        .ok_or_else(|| "that file entry no longer exists".to_string())
+}
+
+/// What a file entry points to now: each file's name, location and whether
+/// it is still there. Looked up live, so a moved file shows as missing.
+#[tauri::command]
+fn file_entries(app: tauri::AppHandle, id: String) -> Result<Vec<FileEntry>, String> {
+    Ok(file_item_paths(&file_item(&app, &id)?).iter().map(|p| file_entry(p)).collect())
+}
+
+/// Copies a file entry's paths (one per line) or its `file://` links as
+/// plain text. Not recorded as a new history item: the entry already exists.
+#[tauri::command]
+fn copy_file_paths(
+    app: tauri::AppHandle,
+    monitor: tauri::State<Arc<MonitorState>>,
+    id: String,
+    as_url: bool,
+) -> Result<(), String> {
+    let paths = file_item_paths(&file_item(&app, &id)?);
+    let lines: Vec<String> = paths
+        .iter()
+        .map(|p| {
+            if as_url {
+                tauri::Url::from_file_path(p).map(|u| u.to_string()).unwrap_or_else(|_| p.to_string_lossy().into_owned())
+            } else {
+                p.to_string_lossy().into_owned()
+            }
+        })
+        .collect();
+    let text = lines.join("\n");
+    let mut system_clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    write_prepared_payload(
+        &mut system_clipboard,
+        &monitor,
+        &PreparedClipboardPayload::Text { hash: clipboard::hash_bytes(text.as_bytes()), content: text },
+    )
+}
+
+/// Reveals (or opens) file `index` of a file entry. Only paths stored in the
+/// entry can be opened — never an arbitrary path from the page.
+#[tauri::command]
+fn open_file_entry(app: tauri::AppHandle, id: String, index: usize, reveal: bool) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let paths = file_item_paths(&file_item(&app, &id)?);
+    let path = paths.get(index).ok_or_else(|| "that file is not part of this entry".to_string())?;
+    if !path.exists() {
+        return Err(format!("{} is no longer there", path.display()));
+    }
+    if reveal {
+        app.opener().reveal_item_in_dir(path)
+    } else {
+        app.opener().open_path(path.to_string_lossy(), None::<&str>)
+    }
+    .map_err(|e| e.to_string())
 }
 
 fn is_image_item(item: &db::ClipItem) -> bool {
@@ -303,7 +484,13 @@ fn prepare_paste_plan(
 
     let mut prepared = Vec::with_capacity(items.len());
     for (item, image) in items.into_iter().zip(validated_images) {
-        let payload = if let Some(image) = image {
+        let payload = if item.kind == "file" {
+            let paths = available_file_paths(&item)?;
+            PreparedClipboardPayload::Files {
+                hash: clipboard::hash_file_list(&paths),
+                paths,
+            }
+        } else if let Some(image) = image {
             PreparedClipboardPayload::Image {
                 width: image.width,
                 height: image.height,
@@ -333,6 +520,13 @@ fn write_prepared_payload(
     let hash = match payload {
         PreparedClipboardPayload::Text { content, hash } => {
             clipboard.set_text(content).map_err(|e| e.to_string())?;
+            hash
+        }
+        PreparedClipboardPayload::Files { paths, hash } => {
+            clipboard
+                .set()
+                .file_list(paths)
+                .map_err(|e| format!("the files could not be put on the clipboard: {e}"))?;
             hash
         }
         PreparedClipboardPayload::Image {
@@ -468,6 +662,7 @@ fn payload_settle_delay(payload: &PreparedClipboardPayload) -> Duration {
             let extra = (content.len() as u64 / (64 * 1024)) * 20;
             Duration::from_millis((80 + extra).min(260))
         }
+        PreparedClipboardPayload::Files { .. } => Duration::from_millis(400),
         PreparedClipboardPayload::Image { bytes, .. } => {
             let extra = (bytes.len() as u64 / (4 * 1024 * 1024)) * 150;
             Duration::from_millis((700 + extra).min(1_800))
@@ -1072,9 +1267,11 @@ fn snippet_payload(
     snippet: &snippets::store::Snippet,
 ) -> Result<PreparedClipboardPayload, String> {
     let Some(png) = service.image_png(snippet) else {
+        // Same text as typed expansion inserts, including its whitespace setting.
+        let content = format!("{}{}", snippet.content, snippets::store::suffix_text(&snippet.suffix));
         return Ok(PreparedClipboardPayload::Text {
-            hash: clipboard::hash_bytes(snippet.content.as_bytes()),
-            content: snippet.content.clone(),
+            hash: clipboard::hash_bytes(content.as_bytes()),
+            content,
         });
     };
     let rgba = image::load_from_memory_with_format(&png?, image::ImageFormat::Png)
@@ -1130,6 +1327,77 @@ fn close_editor(app: tauri::AppHandle, session: tauri::State<EditorSession>) {
             let _ = win.set_focus();
         }
     }
+}
+
+fn decode_data_url_png(data_url: &str) -> Result<(Vec<u8>, image::RgbaImage), String> {
+    let b64 = data_url
+        .split(',')
+        .nth(1)
+        .ok_or_else(|| "malformed data URL".to_string())?;
+    use base64::Engine;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .map_err(|e| e.to_string())?;
+    let pixels = image::load_from_memory(&bytes)
+        .map_err(|e| format!("the edited image is not valid: {e}"))?
+        .to_rgba8();
+    Ok((bytes, pixels))
+}
+
+/// Saves an edited image as a new history item next to the untouched
+/// original (the editor's default). Returns the new item's id.
+#[tauri::command]
+fn save_annotated_image_as_new(app: tauri::AppHandle, id: String, data_url: String) -> Result<String, String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let conn = db::open(&data_dir);
+    let item = db::get_item(&conn, &id).ok_or_else(|| "the original image is no longer in history".to_string())?;
+    let (bytes, pixels) = decode_data_url_png(&data_url)?;
+    let new_id = clipboard::uuid_like();
+    let file = format!("{new_id}.png");
+    let images_dir = data_dir.join("images");
+    let temp_path = images_dir.join(format!("{new_id}.saving.png"));
+    std::fs::write(&temp_path, &bytes)
+        .and_then(|_| std::fs::rename(&temp_path, images_dir.join(&file)))
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&temp_path);
+            format!("could not save the edited image: {e}")
+        })?;
+    let kind = if item.kind == "screenshot" { "screenshot" } else { "image" };
+    db::insert_item(
+        &conn,
+        &new_id,
+        kind,
+        &file,
+        &format!("{}x{}", pixels.width(), pixels.height()),
+        &item.source_app,
+        chrono::Utc::now().timestamp_millis(),
+        &clipboard::hash_bytes(pixels.as_raw()),
+    );
+    db::mark_edited(&conn, &new_id);
+    let _ = app.emit("clipflow://new-item", &new_id);
+    ocr::wake(&app);
+    Ok(new_id)
+}
+
+/// "Save & Paste": closes the editor without bringing the popup back, then
+/// pastes the saved images into the app the popup was opened over.
+#[tauri::command]
+async fn paste_after_edit(
+    app: tauri::AppHandle,
+    monitor: tauri::State<'_, Arc<MonitorState>>,
+    coordinator: tauri::State<'_, Arc<PasteCoordinator>>,
+    session: tauri::State<'_, EditorSession>,
+    ids: Vec<String>,
+) -> Result<(), String> {
+    session.restore_history.store(false, Ordering::Relaxed);
+    if let Some(win) = app.get_webview_window("editor") {
+        let _ = win.hide();
+    }
+    let monitor = monitor.inner().clone();
+    let coordinator = coordinator.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || execute_paste(app, monitor, coordinator, ids))
+        .await
+        .map_err(|e| format!("paste worker failed: {e}"))?
 }
 
 #[tauri::command]
@@ -1365,7 +1633,19 @@ pub fn run() {
             ocr::ocr_set_enabled,
             ocr::ocr_retry_failed,
             ocr::ocr_set_language,
-            ocr::ocr_rescan
+            ocr::ocr_rescan,
+            retention::history_retention_get,
+            monitoring_status,
+            pause_monitoring,
+            update_item_text,
+            save_annotated_image_as_new,
+            paste_after_edit,
+            file_entries,
+            copy_file_paths,
+            open_file_entry,
+            retention::history_retention_preview,
+            retention::history_retention_set,
+            retention::history_clear_expired
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -1380,6 +1660,7 @@ pub fn run() {
             let ocr_service = ocr::OcrService::new(handle.clone(), data_dir.clone());
             app.manage(ocr_service.clone());
             ocr_service.start();
+            retention::start(handle.clone());
             clipboard::spawn_monitor(handle.clone(), data_dir, monitor.clone());
             #[cfg(all(feature = "e2e", target_os = "macos"))]
             e2e::start(
@@ -1637,6 +1918,178 @@ mod paste_tests {
 
     fn insert(conn: &rusqlite::Connection, id: &str, kind: &str, content: &str, created_at: i64) {
         db::insert_item(conn, id, kind, content, content, "", created_at, id);
+    }
+
+    const DAY: i64 = 86_400_000;
+
+    #[test]
+    fn retention_off_by_default_and_protects_favorites_and_pinned() {
+        let root = TestDataDir::new();
+        let conn = db::open(root.path());
+        let now = 100 * DAY;
+        assert_eq!(db::load_retention(&conn), db::Retention::default());
+        insert(&conn, "old", "text", "old", now - 10 * DAY);
+        insert(&conn, "new", "text", "new", now - DAY / 2);
+        insert(&conn, "fav", "text", "fav", now - 10 * DAY);
+        insert(&conn, "pin", "text", "pin", now - 10 * DAY);
+        // Clock moved back: an item "from the future" never expires.
+        insert(&conn, "future", "text", "future", now + 5 * DAY);
+        db::set_favorite(&conn, "fav", true);
+        db::set_pinned(&conn, "pin", true);
+
+        // Off (the default for everyone): nothing is ever deleted.
+        let off = db::Retention::default();
+        assert_eq!(db::delete_expired(&conn, root.path(), &off, now).unwrap(), 0);
+
+        let week = db::Retention { days: 7, ..off };
+        assert_eq!(db::count_expired(&conn, &week, now), 1);
+        assert_eq!(db::delete_expired(&conn, root.path(), &week, now).unwrap(), 1);
+        assert!(db::get_item(&conn, "old").is_none());
+        for kept in ["new", "fav", "pin", "future"] {
+            assert!(db::get_item(&conn, kept).is_some(), "{kept} must be kept");
+        }
+
+        let everything = db::Retention { days: 7, include_favorites: true, include_pinned: true };
+        assert_eq!(db::count_expired(&conn, &everything, now), 2);
+        db::save_retention(&conn, &everything);
+        assert_eq!(db::load_retention(&conn), everything);
+    }
+
+    #[test]
+    fn retention_removes_managed_images_but_never_referenced_user_files() {
+        let root = TestDataDir::new();
+        let conn = db::open(root.path());
+        let now = 100 * DAY;
+        root.save_image("shot.png", [1, 2, 3, 255]);
+        root.save_image("shared.png", [4, 5, 6, 255]);
+        insert(&conn, "img", "image", "shot.png", now - 40 * DAY);
+        // Two entries using one file: deleting the old one must keep the file.
+        insert(&conn, "shared-old", "image", "shared.png", now - 40 * DAY);
+        insert(&conn, "shared-new", "image", "shared.png", now);
+        let user_file = root.path().join("Final Python.zip");
+        std::fs::write(&user_file, b"zip").unwrap();
+        let paths = serde_json::to_string(&[user_file.to_string_lossy()]).unwrap();
+        insert(&conn, "file", "file", &paths, now - 40 * DAY);
+
+        let month = db::Retention { days: 30, ..db::Retention::default() };
+        assert_eq!(db::delete_expired(&conn, root.path(), &month, now).unwrap(), 3);
+        assert!(!root.path().join("images/shot.png").exists());
+        assert!(root.path().join("images/shared.png").exists());
+        assert!(user_file.exists(), "removing a file entry never deletes the file itself");
+    }
+
+    #[test]
+    fn retention_handles_thousands_of_items_in_one_transaction() {
+        let root = TestDataDir::new();
+        let conn = db::open(root.path());
+        let now = 1000 * DAY;
+        conn.execute_batch("BEGIN").unwrap();
+        for i in 0..5000 {
+            insert(&conn, &format!("i{i}"), "text", "x", now - (i % 20) * DAY);
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        let retention = db::Retention { days: 10, ..db::Retention::default() };
+        let started = std::time::Instant::now();
+        let removed = db::delete_expired(&conn, root.path(), &retention, now).unwrap();
+        assert_eq!(removed, 2250); // ages 11..19 days, 250 each
+        assert_eq!(db::list_items(&conn, 10_000).len(), 2750);
+        assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn file_entries_keep_real_paths_and_encode_links() {
+        let root = TestDataDir::new();
+        let names = ["Final Python.zip", "보고서 2026.xlsx", "ឯកសារ.pdf", "folder with space"];
+        let paths: Vec<PathBuf> = names.iter().map(|n| root.path().join(n)).collect();
+        for p in &paths[..3] {
+            std::fs::write(p, b"data").unwrap();
+        }
+        std::fs::create_dir(&paths[3]).unwrap();
+
+        let zip = file_entry(&paths[0]);
+        assert!(zip.exists && zip.accessible && !zip.is_dir);
+        assert_eq!(zip.extension, "zip");
+        assert_eq!(zip.size, Some(4));
+        let url = zip.url.unwrap();
+        assert!(url.starts_with("file:///") && url.ends_with("/Final%20Python.zip"), "{url}");
+        let korean = file_entry(&paths[1]).url.unwrap();
+        assert!(!korean.contains(' ') && korean.contains("%EB%B3%B4"), "{korean}");
+        assert!(file_entry(&paths[3]).is_dir);
+
+        // Order is preserved; preview names the files.
+        assert_eq!(clipboard::file_list_preview(&paths), "Final Python.zip, 보고서 2026.xlsx +2");
+        assert_ne!(clipboard::hash_file_list(&paths), clipboard::hash_file_list(&paths[..1]));
+    }
+
+    #[test]
+    fn pasting_a_moved_or_deleted_file_fails_before_touching_the_clipboard() {
+        let root = TestDataDir::new();
+        let conn = db::open(root.path());
+        let present = root.path().join("a.pdf");
+        let gone = root.path().join("moved.pdf");
+        std::fs::write(&present, b"pdf").unwrap();
+        let content = serde_json::to_string(&[present.to_string_lossy(), gone.to_string_lossy()]).unwrap();
+        insert(&conn, "files", "file", &content, 1);
+        let error = match prepare_paste_plan(&conn, root.path(), &["files".into()]) {
+            Err(e) => e,
+            Ok(_) => panic!("a missing file must stop the paste"),
+        };
+        assert!(error.contains("moved.pdf") && error.contains("Nothing was pasted"), "{error}");
+
+        std::fs::write(&gone, b"pdf").unwrap();
+        match prepare_paste_plan(&conn, root.path(), &["files".into()]).unwrap() {
+            PastePlan::Sequential { items } => match &items[0].payload {
+                PreparedClipboardPayload::Files { paths, .. } => assert_eq!(paths, &vec![present, gone]),
+                _ => panic!("file entries paste as files, never as their names"),
+            },
+            PastePlan::ImageBatch { .. } => panic!("file entries are not image batches"),
+        }
+    }
+
+    /// Uses the real system clipboard (restored afterwards), so it only runs
+    /// on request: `cargo test files_clipboard_roundtrip -- --ignored`.
+    #[test]
+    #[ignore]
+    fn files_clipboard_roundtrip() {
+        let root = TestDataDir::new();
+        let paths: Vec<PathBuf> = ["Final Python.zip", "보고서 2026.xlsx", "ឯកសារ.pdf"]
+            .iter()
+            .map(|n| {
+                let p = root.path().join(n);
+                std::fs::write(&p, b"x").unwrap();
+                p.canonicalize().unwrap()
+            })
+            .collect();
+        let mut system = arboard::Clipboard::new().unwrap();
+        let saved = system.get_text().ok();
+        let monitor = Arc::new(MonitorState::default());
+        let payload = PreparedClipboardPayload::Files { hash: clipboard::hash_file_list(&paths), paths: paths.clone() };
+        write_prepared_payload(&mut system, &monitor, &payload).unwrap();
+        let read = clipboard::clipboard_file_paths(&mut system);
+        if let Some(text) = saved {
+            system.set_text(text).unwrap();
+        }
+        assert_eq!(read.as_ref(), Some(&paths), "Paste File must publish every file, in order");
+        // Clipet's own paste is recognized and not recorded again.
+        assert_eq!(monitor.last_self_write_hash.lock().unwrap().as_deref(), Some(clipboard::hash_file_list(&paths).as_str()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_symlinks_and_unreadable_files_are_reported() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TestDataDir::new();
+        let link = root.path().join("link.txt");
+        std::os::unix::fs::symlink(root.path().join("nowhere.txt"), &link).unwrap();
+        let broken = file_entry(&link);
+        assert!(broken.is_symlink && !broken.exists);
+
+        let secret = root.path().join("secret.txt");
+        std::fs::write(&secret, b"x").unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let locked = file_entry(&secret);
+        assert!(locked.exists && !locked.accessible);
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
 
     #[test]

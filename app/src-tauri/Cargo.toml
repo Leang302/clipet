@@ -24,6 +24,7 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-autostart = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+unicode-normalization = "0.1"
 arboard = "3"
 rusqlite = { version = "0.31", features = ["bundled"] }
 sha2 = "0.10"
@@ -42,7 +43,7 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["NSA
 objc2-vision = { version = "0.3", default-features = false, features = ["std", "objc2-core-foundation", "VNObservation", "VNRecognizeTextRequest", "VNRequest", "VNRequestHandler", "VNTypes"] }
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Foundation", "Foundation_Collections", "Globalization", "Graphics_Imaging", "Media_Ocr", "Storage", "Storage_Streams", "Win32_System_WinRT"] }
+windows = { version = "0.62", features = ["Foundation", "Foundation_Collections", "Globalization", "Graphics_Imaging", "Media_Ocr", "Storage", "Storage_Streams", "Win32_System_DataExchange", "Win32_System_WinRT"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

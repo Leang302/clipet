@@ -5,6 +5,9 @@ import { applyTheme, loadTheme, saveTheme, THEME_STORAGE_KEY, type ThemeChoice }
 import { SnippetsView, type SnippetSeed } from "./Snippets";
 import { lineMatches, matchItem, type SearchMatch } from "./search";
 import { installPopupDrag } from "./popupDrag";
+import { FileCard, fileItemIcon } from "./FileCard";
+import { TextViewer, isLongText, countLines, PREVIEW_CHARS } from "./TextViewer";
+import { HistorySettings } from "./HistorySettings";
 import "./clipflow.css";
 
 type ClipItem = {
@@ -137,6 +140,8 @@ function isTextual(item: ClipItem): boolean {
 
 function previewLabel(item: ClipItem): string {
   if (item.kind === "link") return item.content;
+  // File entries store their paths as JSON; the preview holds their names.
+  if (item.kind === "file") return item.preview;
   return item.content.length > 70 ? item.content.slice(0, 70) : item.content;
 }
 
@@ -148,6 +153,9 @@ export default function App() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [activeId, setActiveId] = useState<string | null>(null);
   const [anchorId, setAnchorId] = useState<string | null>(null);
+  // The full-text viewer (its item id) and the history settings dialog.
+  const [viewerId, setViewerId] = useState<string | null>(null);
+  const [showHistorySettings, setShowHistorySettings] = useState(false);
   // Bumped each time the popup opens, after the list has reloaded.
   const [openCount, setOpenCount] = useState(0);
   // Small list thumbnails and full-size preview images are cached separately:
@@ -508,6 +516,13 @@ export default function App() {
   function onKeyDown(e: KeyboardEvent) {
     // The Snippets view registers its own keyboard handling.
     if (category === "snippets") return;
+    if (showHistorySettings) return;
+    // While reading, the viewer owns the keyboard; ↑/↓ still move through
+    // the list (and the viewer follows) unless typing in the viewer.
+    if (viewerId) {
+      const typing = document.activeElement instanceof HTMLInputElement || document.activeElement instanceof HTMLTextAreaElement;
+      if (typing || (e.key !== "ArrowDown" && e.key !== "ArrowUp")) return;
+    }
     if (contextMenu || confirmDelete || confirmClear) {
       if (e.key === "Escape") {
         e.preventDefault();
@@ -580,7 +595,7 @@ export default function App() {
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [visibleIds.join(","), activeId, anchorId, selectedIds, category, contextMenu, confirmDelete, confirmClear, query]);
+  }, [visibleIds.join(","), activeId, anchorId, selectedIds, category, contextMenu, confirmDelete, confirmClear, query, viewerId, showHistorySettings]);
 
   // Order selections by their position in the current (sorted/filtered) list,
   // not by Set insertion order — a Shift-range selects in list order already,
@@ -590,6 +605,15 @@ export default function App() {
   // Never silently reorder screenshots during transfer."
   const orderedSelectedIds = visibleIds.filter((id) => selectedIds.has(id));
   const selectedItems = orderedSelectedIds.map(byId).filter((i): i is ClipItem => !!i);
+  // The viewer follows the active item through the list; anything that
+  // isn't text closes it.
+  const viewerItem = viewerId ? items.find((i) => i.id === viewerId && (i.kind === "text" || i.kind === "code")) ?? null : null;
+  useEffect(() => {
+    if (!viewerId || !activeId || activeId === viewerId) return;
+    const next = items.find((i) => i.id === activeId);
+    setViewerId(next && (next.kind === "text" || next.kind === "code") ? next.id : null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeId]);
   const previewList = selectedItems.length ? selectedItems : activeId ? [byId(activeId)!].filter(Boolean) : [];
 
   // Full-size images only for what the preview shows.
@@ -610,7 +634,7 @@ export default function App() {
   const q = query.trim().toLowerCase();
 
   return (
-    <div id="clip-popup">
+    <div id="clip-popup" className={viewerItem ? "reading" : undefined}>
       <div className="popup-body">
         <div id="sidebar">
           {CATEGORIES.map((c) => {
@@ -645,6 +669,14 @@ export default function App() {
             onClick={requestClearNonFavorites}
           >
             🗑 Clear
+          </button>
+          <button
+            className="icon-btn"
+            style={{ width: "100%", marginTop: 6 }}
+            title="Automatic cleanup, pausing recording, clearing everything"
+            onClick={() => setShowHistorySettings(true)}
+          >
+            ⚙ History Settings…
           </button>
           {ocrStatus?.supported && (
             <label className="sidebar-setting" title="Reads text in screenshots and images on this device, so search can find them">
@@ -741,7 +773,7 @@ export default function App() {
                     setContextMenu({ x: e.clientX, y: e.clientY, item });
                   }}
                 >
-                  <div className="clip-thumb">{thumb ? <img src={thumb} alt="" draggable={false} /> : <span>{meta.icon}</span>}</div>
+                  <div className="clip-thumb">{thumb ? <img src={thumb} alt="" draggable={false} /> : <span>{item.kind === "file" ? fileItemIcon(item.content) : meta.icon}</span>}</div>
                   <div className="clip-meta">
                     <div className="clip-title">{previewLabel(item)}</div>
                     <div className="clip-sub">
@@ -762,6 +794,22 @@ export default function App() {
         </div>
 
         <div id="preview-panel">
+          {viewerItem && (
+            <TextViewer
+              key={viewerItem.id}
+              id={viewerItem.id}
+              text={viewerItem.content}
+              mono={viewerItem.kind === "code"}
+              onClose={() => setViewerId(null)}
+              onCopy={copyText}
+              onSave={async (content) => {
+                await invoke("update_item_text", { id: viewerItem.id, content });
+                await refresh();
+                toast("Saved");
+              }}
+            />
+          )}
+          {!viewerItem && <>
           <div id="preview-header">
             <span>
               {previewList.length > 1
@@ -791,6 +839,15 @@ export default function App() {
                     ? (
                       <div className="ocr-image">
                         <img src={imageUrls[item.id]} alt="" draggable={false} />
+                        <button
+                          className="image-edit-btn"
+                          title="Edit / annotate this image"
+                          aria-label="Edit image"
+                          disabled={isPasting}
+                          onClick={() => openEditor([item.id])}
+                        >
+                          ✎ Edit
+                        </button>
                         {/* Highlight the lines of recognized text that match the search. */}
                         {q && parseOcrLines(item)
                           .filter((line) => lineMatches(query, line.text))
@@ -816,15 +873,31 @@ export default function App() {
                     onRescan={() => rescan([item.id])}
                   />
                 )}
-                {item.kind === "text" && <div className="preview-text selectable">{item.content}</div>}
-                {item.kind === "code" && <div className="preview-text selectable" style={{ background: "#1b1f24", color: "#d6e2ff" }}>{item.content}</div>}
+                {(item.kind === "text" || item.kind === "code") && (
+                  <>
+                    <div
+                      className={"preview-text selectable" + (isLongText(item.content) ? " clamped" : "") + (item.kind === "code" ? " code" : "")}
+                      style={item.kind === "code" ? { background: "#1b1f24", color: "#d6e2ff" } : undefined}
+                    >
+                      {item.content.length > PREVIEW_CHARS ? item.content.slice(0, PREVIEW_CHARS) : item.content}
+                    </div>
+                    {isLongText(item.content) && (
+                      <div className="expand-row">
+                        <span className="card-caption">{item.content.length.toLocaleString()} characters · {countLines(item.content).toLocaleString()} lines</span>
+                        <button className="icon-btn" title="Read, search and edit the full text" onClick={() => setViewerId(item.id)}>⤢ Expand</button>
+                      </div>
+                    )}
+                  </>
+                )}
                 {item.kind === "link" && (
                   <>
                     <div className="preview-link-domain">{(() => { try { return new URL(item.content).hostname; } catch { return ""; } })()}</div>
                     <div className="preview-link-url selectable">{item.content}</div>
                   </>
                 )}
-                {item.kind === "file" && <div>{item.content}</div>}
+                {item.kind === "file" && (
+                  <FileCard key={item.id} id={item.id} isPasting={isPasting} onPaste={() => pasteOne(item.id)} toast={toast} />
+                )}
                 {item.edited && <div className="card-caption">edited</div>}
                 <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
                   {(item.kind === "image" || item.kind === "screenshot") && (
@@ -835,14 +908,17 @@ export default function App() {
                   {(isTextual(item) || isImage(item)) && (
                     <button className="icon-btn" onClick={() => createSnippetFrom(item)}>✂️ Snippet</button>
                   )}
-                  <button className="icon-btn" disabled={isPasting} onClick={() => pasteOne(item.id)}>
-                    {isPasting ? "Pasting…" : "Paste"}
-                  </button>
+                  {item.kind !== "file" && (
+                    <button className="icon-btn" disabled={isPasting} onClick={() => pasteOne(item.id)}>
+                      {isPasting ? "Pasting…" : "Paste"}
+                    </button>
+                  )}
                   <button className="icon-btn danger" disabled={isPasting} onClick={() => removeItem(item)}>Delete</button>
                 </div>
               </div>
             ))}
           </div>
+          </>}
         </div>
         </>}
       </div>
@@ -899,6 +975,10 @@ export default function App() {
       )}
 
       <div id="toast" className={toastMsg ? "show" : ""}>{toastMsg}</div>
+
+      {showHistorySettings && (
+        <HistorySettings totalItems={items.length} onClose={() => setShowHistorySettings(false)} toast={toast} />
+      )}
 
       {confirmClear && (
         <div

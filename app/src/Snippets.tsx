@@ -15,6 +15,15 @@ export type Snippet = {
   created_at: number;
   updated_at: number;
   last_used_at: number | null;
+  /** What follows the inserted text: nothing, one space, or a line break. */
+  suffix: Suffix;
+};
+
+type Suffix = "exact" | "space" | "newline";
+const SUFFIX_LABELS: Record<Suffix, string> = {
+  exact: "Nothing — exact text",
+  space: "One space",
+  newline: "New line",
 };
 
 type SnippetSettings = {
@@ -43,6 +52,7 @@ type Draft = {
   image_item: string | null;
   /** Preview of the picked (or current) image. */
   imageUrl: string | null;
+  suffix: Suffix;
   enabled: boolean;
 };
 
@@ -110,6 +120,7 @@ export function SnippetsView(props: {
       id: null, name: "", keyword: "", content: seed.content, enabled: true,
       content_type: seed.imageItem ? "image" : "text",
       image_item: seed.imageItem ?? null,
+      suffix: "exact",
       imageUrl: seed.imageUrl ?? null,
     });
   }, [seed?.nonce]);
@@ -166,7 +177,7 @@ export function SnippetsView(props: {
   function startNew() {
     setShowSettings(false);
     setError(null);
-    setDraft({ id: null, name: "", keyword: "", content: "", content_type: "text", image_item: null, imageUrl: null, enabled: true });
+    setDraft({ id: null, name: "", keyword: "", content: "", content_type: "text", image_item: null, imageUrl: null, suffix: "exact", enabled: true });
   }
 
   function startEdit(s: Snippet) {
@@ -179,15 +190,16 @@ export function SnippetsView(props: {
       content_type: image ? "image" : "text",
       image_item: null,
       imageUrl: image ? previews[previewKey(s)] || null : null,
+      suffix: s.suffix ?? "exact",
     });
   }
 
   async function save() {
     if (!draft) return;
     try {
-      const { id, name, keyword, content, content_type, image_item, enabled } = draft;
+      const { id, name, keyword, content, content_type, image_item, suffix, enabled } = draft;
       const saved = await invoke<Snippet>("snippet_save", {
-        input: { id, name, keyword, content, content_type, image_item, enabled },
+        input: { id, name, keyword, content, content_type, image_item, suffix, enabled },
       });
       setDraft(null);
       setError(null);
@@ -412,6 +424,15 @@ export function SnippetsView(props: {
                   )}
                 </div>
               )}
+              {draft.content_type === "text" && (
+                <label>
+                  <span>After the text</span>
+                  <select value={draft.suffix} onChange={(e) => setDraft({ ...draft, suffix: e.target.value as Suffix })}>
+                    {(Object.keys(SUFFIX_LABELS) as Suffix[]).map((k) => <option key={k} value={k}>{SUFFIX_LABELS[k]}</option>)}
+                  </select>
+                  <small>The key you press to expand ({triggerLabel}) is never inserted. Spaces and line breaks you typed in the content are kept exactly.</small>
+                </label>
+              )}
               <label className="snippet-check">
                 <input type="checkbox" checked={draft.enabled} onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })} />
                 <span>Enabled</span>
@@ -517,6 +538,11 @@ function SettingsForm(props: { settings: SnippetSettings; onChange: (patch: Part
 
   return (
     <div className="snippet-form">
+      <p className="snippet-note">
+        Password fields: typing a shortcut there never expands — macOS hides what you type in password fields from
+        other apps, and Clipet doesn't work around that. To insert a snippet there, open Clipet (⌘⇧V), go to
+        Snippets and press Enter; it pastes like ⌘V, which works wherever the field allows pasting.
+      </p>
       <label className="snippet-check">
         <input type="checkbox" checked={settings.enabled} onChange={(e) => onChange({ enabled: e.target.checked })} />
         <span>Enable Smart Snippets</span>
@@ -524,8 +550,8 @@ function SettingsForm(props: { settings: SnippetSettings; onChange: (patch: Part
       <label>
         <span>Expand when I press</span>
         <select value={settings.trigger_mode} onChange={(e) => onChange({ trigger_mode: e.target.value as SnippetSettings["trigger_mode"] })}>
-          <option value="space">Space (adds a space after)</option>
-          <option value="tab">Tab (nothing added)</option>
+          <option value="space">Space</option>
+          <option value="tab">Tab</option>
           <option value="both">Space or Tab</option>
         </select>
       </label>

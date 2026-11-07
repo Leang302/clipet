@@ -16,6 +16,20 @@ pub const SNIPPETS_DB_FILE: &str = "snippets.sqlite3";
 pub const SNIPPET_IMAGES_DIR: &str = "snippet_images";
 
 pub const TEXT: &str = "text";
+
+/// What follows the inserted text: nothing ("exact", the default), one
+/// space, or a line break. The trigger key itself is never inserted.
+pub fn suffix_text(suffix: &str) -> &'static str {
+    match suffix {
+        "space" => " ",
+        "newline" => "\n",
+        _ => "",
+    }
+}
+
+pub fn valid_suffix(suffix: &str) -> bool {
+    matches!(suffix, "exact" | "space" | "newline")
+}
 pub const IMAGE: &str = "image";
 
 /// Where an image snippet's PNG lives. `content` holds only the file name.
@@ -25,7 +39,7 @@ pub fn image_path(data_dir: &Path, snippet: &Snippet) -> Option<std::path::PathB
 
 /// Bumped whenever a migration step is added below. Stored in SQLite's own
 /// `PRAGMA user_version`, so each step runs exactly once per database.
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 pub fn open(data_dir: &Path) -> Connection {
     std::fs::create_dir_all(data_dir).expect("failed to create app data dir");
@@ -68,7 +82,17 @@ fn migrate(conn: &Connection) {
         )
         .expect("failed to migrate database to schema version 1");
     }
-    debug_assert!(SCHEMA_VERSION == 1, "add the new migration step above");
+    if version < 2 {
+        // Per-snippet whitespace after the inserted text (see `suffix_text`).
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE snippets ADD COLUMN suffix TEXT NOT NULL DEFAULT 'exact';
+             PRAGMA user_version = 2;
+             COMMIT;",
+        )
+        .expect("failed to migrate database to schema version 2");
+    }
+    debug_assert!(SCHEMA_VERSION == 2, "add the new migration step above");
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -86,9 +110,10 @@ pub struct Snippet {
     pub created_at: i64,
     pub updated_at: i64,
     pub last_used_at: Option<i64>,
+    pub suffix: String,
 }
 
-const SNIPPET_COLUMNS: &str = "id, name, keyword, content, content_type, category, enabled, favorite, use_count, created_at, updated_at, last_used_at";
+const SNIPPET_COLUMNS: &str = "id, name, keyword, content, content_type, category, enabled, favorite, use_count, created_at, updated_at, last_used_at, suffix";
 
 fn row_to_snippet(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snippet> {
     Ok(Snippet {
@@ -104,6 +129,7 @@ fn row_to_snippet(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snippet> {
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
         last_used_at: row.get(11)?,
+        suffix: row.get(12)?,
     })
 }
 
@@ -146,8 +172,8 @@ pub fn keyword_owner(conn: &Connection, keyword: &str, except_id: Option<&str>) 
 
 pub fn insert_snippet(conn: &Connection, snippet: &Snippet) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO snippets (id, name, keyword, content, content_type, category, enabled, favorite, use_count, created_at, updated_at, last_used_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        "INSERT INTO snippets (id, name, keyword, content, content_type, category, enabled, favorite, use_count, created_at, updated_at, last_used_at, suffix)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             snippet.id,
             snippet.name,
@@ -161,6 +187,7 @@ pub fn insert_snippet(conn: &Connection, snippet: &Snippet) -> Result<(), String
             snippet.created_at,
             snippet.updated_at,
             snippet.last_used_at,
+            snippet.suffix,
         ],
     )
     .map(|_| ())
@@ -174,14 +201,15 @@ pub fn update_snippet(
     keyword: &str,
     content: &str,
     content_type: &str,
+    suffix: &str,
     enabled: bool,
     updated_at: i64,
 ) -> Result<(), String> {
     let changed = conn
         .execute(
-            "UPDATE snippets SET name = ?1, keyword = ?2, content = ?3, content_type = ?4, enabled = ?5, updated_at = ?6
+            "UPDATE snippets SET name = ?1, keyword = ?2, content = ?3, content_type = ?4, enabled = ?5, updated_at = ?6, suffix = ?8
              WHERE id = ?7",
-            params![name, keyword, content, content_type, enabled as i64, updated_at, id],
+            params![name, keyword, content, content_type, enabled as i64, updated_at, id, suffix],
         )
         .map_err(|e| format!("could not save the snippet: {e}"))?;
     if changed == 0 {
@@ -329,6 +357,7 @@ mod tests {
             created_at: 1,
             updated_at: 1,
             last_used_at: None,
+            suffix: "exact".into(),
         }
     }
 
@@ -338,13 +367,14 @@ mod tests {
         {
             let conn = open(&dir.0);
             insert_snippet(&conn, &snippet("a", "name")).unwrap();
-            update_snippet(&conn, "a", "Name", "name", "KimLeang", TEXT, true, 5).unwrap();
+            update_snippet(&conn, "a", "Name", "name", "KimLeang", TEXT, "newline", true, 5).unwrap();
             set_snippet_enabled(&conn, "a", false, 6);
             bump_snippet_usage(&conn, "a", 7);
         }
         let conn = open(&dir.0);
         let got = get_snippet(&conn, "a").unwrap();
         assert_eq!(got.content, "KimLeang");
+        assert_eq!(got.suffix, "newline");
         assert!(!got.enabled);
         assert_eq!(got.use_count, 1);
         assert_eq!(got.last_used_at, Some(7));
@@ -425,6 +455,31 @@ mod tests {
         let partial = load_settings(&conn);
         assert_eq!(partial.prefix, "/");
         assert!(partial.escape_enabled);
+    }
+
+    #[test]
+    fn version_1_databases_gain_exact_suffix_and_keep_snippets() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(&dir.0).unwrap();
+        {
+            // A database exactly as schema version 1 created it.
+            let conn = Connection::open(dir.0.join(SNIPPETS_DB_FILE)).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE snippets (id TEXT PRIMARY KEY, name TEXT NOT NULL, keyword TEXT NOT NULL,
+                   content TEXT NOT NULL, content_type TEXT NOT NULL DEFAULT 'text', category TEXT,
+                   enabled INTEGER NOT NULL DEFAULT 1, favorite INTEGER NOT NULL DEFAULT 0,
+                   use_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                   updated_at INTEGER NOT NULL, last_used_at INTEGER, app_rules TEXT NOT NULL DEFAULT '');
+                 CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO snippets (id, name, keyword, content, created_at, updated_at)
+                   VALUES ('old', 'Old', 'old', 'Hello World', 1, 1);
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        }
+        let conn = open(&dir.0);
+        let old = get_snippet(&conn, "old").unwrap();
+        assert_eq!((old.content.as_str(), old.suffix.as_str()), ("Hello World", "exact"));
     }
 
     #[test]

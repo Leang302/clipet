@@ -261,3 +261,76 @@ html[data-window="history"] body {
 .snippet-image-choice img { width: 100%; height: 100%; object-fit: cover; }
 .snippet-image-choice:hover { border-color: var(--border-strong); }
 .snippet-image-choice.on { border-color: var(--accent); }
+
+/* Keyboard focus is always visible; mouse clicks don't draw rings. */
+#clip-popup :focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Image preview: a quick Edit button appears on hover or keyboard focus. */
+.ocr-image { position: relative; }
+.image-edit-btn {
+  position: absolute; top: 8px; right: 8px; z-index: 2;
+  padding: 4px 10px; font: inherit; font-size: 12px; cursor: pointer;
+  color: #fff; background: rgba(20, 20, 24, 0.72); border: 1px solid rgba(255, 255, 255, 0.25); border-radius: 7px;
+  opacity: 0; transition: opacity 0.12s ease;
+}
+.ocr-image:hover .image-edit-btn, .image-edit-btn:focus-visible { opacity: 1; }
+.image-edit-btn:hover { background: rgba(20, 20, 24, 0.88); }
+
+/* Long text: a compact preview, with the full viewer one click away. */
+.preview-text.clamped { max-height: 260px; overflow: hidden; -webkit-mask-image: linear-gradient(to bottom, #000 75%, transparent); mask-image: linear-gradient(to bottom, #000 75%, transparent); }
+.preview-text.code { white-space: pre; overflow-x: auto; }
+.expand-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 6px; }
+
+/* Reading mode: the sidebar steps aside so the viewer gets the width, while
+   the history list stays usable next to it. */
+#clip-popup.reading #sidebar { display: none; }
+.text-viewer { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.text-viewer-bar { display: flex; align-items: center; gap: 6px; padding: 8px 10px; border-bottom: 1px solid var(--border); min-width: 0; }
+.text-viewer-bar .spacer { flex: 1; }
+.text-viewer-search { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.text-viewer-search input { width: 180px; min-width: 0; font: inherit; font-size: 12.5px; padding: 4px 8px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--bg-panel-alt); color: var(--text-main); }
+.match-count { font-size: 11.5px; color: var(--text-muted); min-width: 62px; }
+.text-viewer-wrap { display: flex; align-items: center; gap: 4px; font-size: 12px; color: var(--text-muted); white-space: nowrap; }
+.text-viewer-body {
+  flex: 1; min-height: 0; overflow: auto; margin: 0; padding: 12px 14px;
+  font-size: 13px; line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4;
+  color: var(--text-main); background: var(--bg-panel); border: none; resize: none; outline: none;
+}
+.text-viewer-body.mono { font-family: var(--mono); font-size: 12.5px; }
+.text-viewer-body.nowrap { white-space: pre; overflow-wrap: normal; }
+textarea.text-viewer-body { font: inherit; font-size: 13px; }
+textarea.text-viewer-body.mono { font-family: var(--mono); }
+.text-viewer-body mark { background: rgba(255, 200, 0, 0.35); color: inherit; border-radius: 2px; }
+.text-viewer-body mark.current { background: rgba(255, 150, 0, 0.8); }
+.text-viewer-foot { padding: 5px 14px; font-size: 11px; color: var(--text-faint); border-top: 1px solid var(--border); }
+.text-viewer-error { padding: 6px 14px; font-size: 12px; color: var(--danger); }
+
+/* File entries */
+.file-card { display: flex; flex-direction: column; gap: 8px; }
+.file-list { display: flex; flex-direction: column; gap: 6px; max-height: 260px; overflow-y: auto; }
+.file-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg-panel-alt); min-width: 0; }
+.file-row.missing { opacity: 0.65; border-style: dashed; }
+.file-icon { font-size: 22px; line-height: 1; }
+.file-info { flex: 1; min-width: 0; }
+.file-name { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.file-path { font-family: var(--mono); font-size: 11px; color: var(--text-muted); overflow-wrap: anywhere; margin-top: 2px; }
+.file-meta { font-size: 11px; color: var(--text-faint); margin-top: 3px; }
+.file-row.missing .file-meta { color: var(--danger); }
+.file-row-actions { display: flex; gap: 4px; }
+.file-warning { font-size: 12px; line-height: 1.45; padding: 8px 10px; border-radius: 7px; color: var(--danger); background: rgba(229, 72, 77, 0.1); }
+.file-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+.card-caption.error { color: var(--danger); }
+
+/* History settings */
+.history-settings { width: min(460px, 100%); max-height: calc(100vh - 40px); overflow-y: auto; }
+.history-settings section { padding: 10px 0; border-bottom: 1px solid var(--border); }
+.history-settings section:last-of-type { border-bottom: none; }
+.hs-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; font-size: 13px; margin-bottom: 6px; }
+.hs-row select, .hs-row input { font: inherit; font-size: 12.5px; padding: 4px 6px; border: 1px solid var(--border-strong); border-radius: 6px; background: var(--bg-panel); color: var(--text-main); }
+.hs-row input { width: 90px; }
+.hs-check { display: flex; align-items: center; gap: 7px; font-size: 12.5px; margin: 4px 0; }
+.hs-note { margin: 6px 0 0; font-size: 12px; line-height: 1.5; color: var(--text-muted); }
+.hs-note.warn { color: var(--danger); }
+.hs-status { font-size: 12.5px; color: var(--text-muted); }
+.history-settings .recovery-actions { margin-top: 10px; flex-wrap: wrap; }
+.snippet-note { margin: 0; font-size: 12px; line-height: 1.5; color: var(--text-muted); padding: 8px 10px; border-radius: 7px; background: var(--bg-panel-alt); }

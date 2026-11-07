@@ -147,7 +147,7 @@ fn build_live(conn: &rusqlite::Connection) -> Live {
                 s.keyword.as_str(),
                 IndexedSnippet {
                     id: s.id.clone(),
-                    content: s.content.clone(),
+                    content: format!("{}{}", s.content, store::suffix_text(&s.suffix)),
                     image: s.content_type == store::IMAGE,
                 },
             )
@@ -419,6 +419,9 @@ pub struct SnippetInput {
     /// keeps the snippet's current image.
     #[serde(default)]
     pub image_item: Option<String>,
+    /// `"exact"` (default), `"space"` or `"newline"`.
+    #[serde(default)]
+    pub suffix: Option<String>,
     pub enabled: bool,
 }
 
@@ -494,10 +497,17 @@ pub fn snippet_save(service: Service, input: SnippetInput) -> Result<Snippet, St
         (store::TEXT, input.content.clone(), false)
     };
 
+    // Images have nothing to append to.
+    let suffix = match input.suffix.as_deref() {
+        _ if content_type == store::IMAGE => "exact",
+        None => "exact",
+        Some(s) if store::valid_suffix(s) => s,
+        Some(s) => return Err(format!("unknown insertion setting: {s}")),
+    };
     let now = now_ms();
     let saved = match &existing {
         Some(old) => store::update_snippet(
-            &conn, &old.id, &name, &keyword, &content, content_type, input.enabled, now,
+            &conn, &old.id, &name, &keyword, &content, content_type, suffix, input.enabled, now,
         )
         .map(|_| old.id.clone()),
         None => {
@@ -517,6 +527,7 @@ pub fn snippet_save(service: Service, input: SnippetInput) -> Result<Snippet, St
                     created_at: now,
                     updated_at: now,
                     last_used_at: None,
+                    suffix: suffix.to_string(),
                 },
             )
             .map(|_| id)

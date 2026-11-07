@@ -61,6 +61,9 @@ pub fn open(data_dir: &PathBuf) -> Connection {
     std::fs::create_dir_all(data_dir.join("images")).expect("failed to create images dir");
     let conn =
         Connection::open(data_dir.join("clipflow.sqlite3")).expect("failed to open sqlite db");
+    // Capture, OCR and cleanup each use their own connection; wait for a
+    // briefly locked database instead of failing (and dropping a capture).
+    conn.busy_timeout(std::time::Duration::from_secs(3)).ok();
     conn.execute(
         "CREATE TABLE IF NOT EXISTS clip_items (
             id TEXT PRIMARY KEY,
@@ -272,6 +275,25 @@ pub fn find_image_by_hash(conn: &Connection, hash: &str) -> Option<(String, Stri
     .ok()
 }
 
+/// The newest item of `kind` recorded with `hash`.
+pub fn find_item_by_hash(conn: &Connection, kind: &str, hash: &str) -> Option<String> {
+    conn.query_row(
+        "SELECT id FROM clip_items WHERE content_hash = ?1 AND kind = ?2 ORDER BY created_at DESC LIMIT 1",
+        params![hash, kind],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+pub fn update_text(conn: &Connection, id: &str, content: &str, preview: &str, hash: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE clip_items SET content = ?1, preview = ?2, content_hash = ?3, edited = 1 WHERE id = ?4",
+        params![content, preview, hash, id],
+    )
+    .map(|_| ())
+    .map_err(|e| format!("could not save the text: {e}"))
+}
+
 pub fn set_content_hash(conn: &Connection, id: &str, hash: &str) {
     conn.execute(
         "UPDATE clip_items SET content_hash = ?1 WHERE id = ?2",
@@ -436,6 +458,93 @@ pub fn clear_non_favorites(conn: &Connection, data_dir: &PathBuf) {
     }
     conn.execute("DELETE FROM clip_items WHERE favorite = 0 AND pinned = 0", [])
         .ok();
+}
+
+/// Which items automatic cleanup may remove.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Retention {
+    /// 0 = keep forever (the default; cleanup never runs until a user picks a period).
+    pub days: u32,
+    pub include_favorites: bool,
+    pub include_pinned: bool,
+}
+
+const RETENTION_KEY: &str = "history.retention";
+
+impl Default for Retention {
+    fn default() -> Self {
+        Self { days: 0, include_favorites: false, include_pinned: false }
+    }
+}
+
+pub fn load_retention(conn: &Connection) -> Retention {
+    get_setting(conn, RETENTION_KEY)
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_retention(conn: &Connection, retention: &Retention) {
+    if let Ok(json) = serde_json::to_string(retention) {
+        set_setting(conn, RETENTION_KEY, &json);
+    }
+}
+
+/// Items captured before `cutoff` (epoch ms) that `retention` lets cleanup
+/// remove. Based on the original capture time; an item dated in the future
+/// (the clock moved back) is never expired.
+const EXPIRED_WHERE: &str = "created_at < ?1 AND (favorite = 0 OR ?2) AND (pinned = 0 OR ?3)";
+
+pub fn count_expired(conn: &Connection, retention: &Retention, now: i64) -> i64 {
+    if retention.days == 0 {
+        return 0;
+    }
+    let cutoff = now - i64::from(retention.days) * 86_400_000;
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM clip_items WHERE {EXPIRED_WHERE}"),
+        params![cutoff, retention.include_favorites, retention.include_pinned],
+        |row| row.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// Deletes expired items in one transaction, then removes the Clipet-managed
+/// image files no remaining item uses. Files that file items point to belong
+/// to the user and are never touched. Returns how many items were removed.
+pub fn delete_expired(conn: &Connection, data_dir: &PathBuf, retention: &Retention, now: i64) -> Result<usize, String> {
+    if retention.days == 0 {
+        return Ok(0);
+    }
+    let cutoff = now - i64::from(retention.days) * 86_400_000;
+    let flags = params![cutoff, retention.include_favorites, retention.include_pinned];
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    let images: Vec<(String, String)> = {
+        let mut stmt = tx
+            .prepare(&format!(
+                "SELECT id, content FROM clip_items WHERE {EXPIRED_WHERE} AND kind IN ('image', 'screenshot')"
+            ))
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(flags, |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|e| e.to_string())?;
+        rows.filter_map(|r| r.ok()).collect()
+    };
+    let removed = tx
+        .execute(&format!("DELETE FROM clip_items WHERE {EXPIRED_WHERE}"), flags)
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
+
+    // After the commit: a crash here leaves only unused files, never rows
+    // pointing at deleted images.
+    let images_dir = data_dir.join("images");
+    for (id, content) in images {
+        let still_used: bool = conn
+            .query_row("SELECT EXISTS(SELECT 1 FROM clip_items WHERE content = ?1 AND kind IN ('image', 'screenshot'))", params![content], |row| row.get(0))
+            .unwrap_or(true);
+        if !still_used {
+            remove_image_files(&images_dir, &id, &content);
+        }
+    }
+    Ok(removed)
 }
 
 pub fn storage_usage_bytes(data_dir: &PathBuf) -> u64 {

@@ -48,6 +48,9 @@ function mockTauri(label) {
       ocr_status: 1, ocr_text: "약정보관리\n매출관리내역 기\n고객정보\nNull PointerException\nSCR-019",
       ocr_lines: JSON.stringify([{ text: "매출관리내역 기", x: 0.1, y: 0.1, w: 0.3, h: 0.05 }, { text: "고객정보", x: 0.1, y: 0.2, w: 0.2, h: 0.05 }]) },
     { ...base, id: "t4", kind: "text", content: "매출", preview: "매출", created_at: Date.now() - 7000 },
+    { ...base, id: "f1", kind: "file", content: JSON.stringify(["/Users/me/Downloads/Final Python.zip"]), preview: "Final Python.zip", created_at: Date.now() - 8000 },
+    { ...base, id: "f2", kind: "file", content: JSON.stringify(["/Users/me/a.pdf", "/Volumes/USB/gone.xlsx"]), preview: "a.pdf, gone.xlsx", created_at: Date.now() - 9000 },
+    { ...base, id: "t5", kind: "text", content: Array.from({ length: 400 }, (_, i) => `line ${i} ${i % 50 === 0 ? "needle" : "hay"}`).join("\n"), preview: "line 0 needle", created_at: Date.now() - 10000 },
   ];
   const snip = { category: null, enabled: true, favorite: false, use_count: 0, created_at: 1, updated_at: 1, last_used_at: null };
   let snippets = [
@@ -73,6 +76,15 @@ function mockTauri(label) {
         case "ocr_set_enabled": return { supported: true, enabled: args.enabled, language: "korean-english", pending: 0, updating: 0, done: 1, failed: 1 };
         case "delete_item": items = items.filter((i) => i.id !== args.id); return null;
         case "get_editor_targets": return ["img1"];
+        case "file_entries": {
+          const entry = (path, exists) => ({ name: path.split("/").pop(), path, url: "file://" + path.split("/").map(encodeURIComponent).join("/"), exists, accessible: exists, is_dir: false, is_symlink: false, size: exists ? 2048 : null, modified: exists ? 1 : null, extension: path.split(".").pop() });
+          return JSON.parse(items.find((i) => i.id === args.id).content).map((p) => entry(p, !p.includes("gone")));
+        }
+        case "history_retention_get": return { retention: { days: 0, include_favorites: false, include_pinned: false }, eligible: 0 };
+        case "history_retention_preview": return args.retention.days === 0 ? 0 : 4;
+        case "history_retention_set": return 4;
+        case "monitoring_status": return { paused: false, until: null };
+        case "pause_monitoring": return { paused: true, until: args.minutes ? Date.now() + args.minutes * 60000 : null };
         case "snippets_list": return snippets;
         case "snippet_image_preview": return img(200, 120, "logo");
         case "snippet_save": {
@@ -125,7 +137,7 @@ function mockTauri(label) {
     await page.locator(".clip-item").nth(2).click({ modifiers: ["Shift"] });
     check("Shift+Click selects a range of items", (await selectedIds()).length === 3, JSON.stringify(await selectedIds()));
     check("Shift+Click does not paint browser text selection", (await sel()) === "", JSON.stringify(await sel()));
-    check("multi-selection shows check indicators", (await page.$$(".clip-item .clip-check")).length === 7);
+    check("multi-selection shows check indicators", (await page.$$(".clip-item .clip-check")).length === 10);
 
     // Cmd+Click toggles one item off.
     await page.locator(".clip-item").nth(1).click({ modifiers: ["Meta"] });
@@ -138,7 +150,7 @@ function mockTauri(label) {
     // Cmd+A with focus in the list selects all items, not page text.
     await page.locator(".clip-item").nth(0).click();
     await page.keyboard.press("Meta+a");
-    check("Cmd+A in the list selects all items", (await selectedIds()).length === 7, JSON.stringify(await selectedIds()));
+    check("Cmd+A in the list selects all items", (await selectedIds()).length === 10, JSON.stringify(await selectedIds()));
     check("Cmd+A in the list selects no page text", (await sel()) === "");
 
     // Cmd+A in the search box selects its text only.
@@ -342,6 +354,99 @@ function mockTauri(label) {
     await page.close();
   }
 
+  // ---------------- Files, long text, image edit, history settings ----------------
+  {
+    const page = await browser.newPage({ viewport: { width: 860, height: 620 } });
+    page.on("pageerror", (e) => errors.push("extras: " + e.message));
+    await page.addInitScript(mockTauri, "history");
+    await page.goto(url);
+    await page.waitForSelector(".clip-item");
+    const callsOf = (cmd) => page.evaluate((cmd) => window.__calls.filter((c) => c.cmd === cmd).map((c) => c.args), cmd);
+
+    // A file entry: shown by name in Files, with explicit file actions.
+    const fileRow = page.locator(".clip-item", { hasText: "Final Python.zip" });
+    check("a file entry is listed by its name, not its stored paths", (await fileRow.count()) === 1 && !(await fileRow.textContent()).includes("["));
+    check("file entries get a file-type icon", (await fileRow.locator(".clip-thumb").textContent()).includes("🗜️"));
+    await fileRow.click();
+    await page.waitForSelector(".file-card .file-row");
+    for (const label of ["Paste File", "Copy Path", "Copy File Link", "Open"]) {
+      check(`file entry offers "${label}"`, (await page.locator(".file-actions button", { hasText: new RegExp(`^${label}$`) }).count()) === 1);
+    }
+    check("file entry offers Reveal in Finder / Show in Explorer", (await page.locator(".file-actions button", { hasText: /Reveal in Finder|Show in Explorer/ }).count()) === 1);
+    check("file entries have no plain Paste that could paste the name", (await page.locator(".preview-card button", { hasText: /^Paste$/ }).count()) === 0);
+    await page.click(".file-actions >> text=Copy Path");
+    await page.click(".file-actions >> text=Copy File Link");
+    const copies = await callsOf("copy_file_paths");
+    check("Copy Path and Copy File Link are separate actions", JSON.stringify(copies.map((c) => c.asUrl)) === "[false,true]", JSON.stringify(copies));
+    await page.click(".file-actions >> text=Paste File");
+    check("Paste File pastes the entry itself", (await callsOf("paste_item")).some((c) => c.id === "f1"));
+    await page.click("#search-input");
+    await page.keyboard.press("Escape");
+
+    // Several files, one missing: clear warning, Paste File disabled.
+    await page.locator(".clip-item", { hasText: "a.pdf, gone.xlsx" }).click();
+    await page.waitForSelector(".file-warning");
+    check("a missing file is flagged", (await page.locator(".file-row.missing").count()) === 1 && (await page.locator(".file-warning").textContent()).includes("1 of 2"));
+    check("Paste File is disabled while a file is missing", await page.locator(".file-actions button.primary").isDisabled());
+
+    // Long text: compact preview + full viewer with search.
+    await page.locator(".clip-item", { hasText: "line 0 needle" }).click();
+    check("long text gets a compact preview", (await page.locator(".preview-text.clamped").count()) === 1);
+    check("long text shows its size", (await page.locator(".expand-row").textContent()).includes("400 lines"));
+    await page.click("text=⤢ Expand");
+    await page.waitForSelector(".text-viewer");
+    check("the viewer gives the text the sidebar's width", await page.locator("#sidebar").isHidden());
+    check("the history list stays visible while reading", await page.locator("#item-list").isVisible());
+    await page.keyboard.press("Meta+f");
+    await page.keyboard.type("needle");
+    check("find in text counts matches", (await page.locator(".match-count").textContent()) === "1 / 8");
+    await page.keyboard.press("Enter");
+    check("Enter jumps to the next match (and does not paste)", (await page.locator(".match-count").textContent()) === "2 / 8" && (await callsOf("paste_item")).length === 1);
+    check("matches are highlighted", (await page.locator(".text-viewer-body mark").count()) === 8 && (await page.locator(".text-viewer-body mark.current").count()) === 1);
+    check("the viewer counts characters and lines", (await page.locator(".text-viewer-foot").textContent()).includes("400 lines"));
+    await page.click(".text-viewer >> text=Edit");
+    await page.locator("textarea.text-viewer-body").fill("edited text");
+    await page.keyboard.press("Meta+s");
+    await page.waitForTimeout(100);
+    check("edited text is saved to the item", JSON.stringify(await callsOf("update_item_text")) === JSON.stringify([{ id: "t5", content: "edited text" }]));
+    const hidesBefore = (await callsOf("hide_history")).length;
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(50);
+    check("closing the viewer keeps the item selected", (await page.$$eval(".clip-item.selected .clip-title", (els) => els.map((e) => e.textContent))).join().startsWith("line 0 needle") && (await page.locator(".text-viewer").count()) === 0);
+    check("Esc in the viewer doesn't hide the popup", (await callsOf("hide_history")).length === hidesBefore);
+
+    // Image preview: hover reveals Edit, which opens the annotation editor.
+    await page.locator(".clip-item", { hasText: "img1.png" }).click();
+    await page.waitForSelector(".ocr-image img");
+    const editBtn = page.locator(".image-edit-btn");
+    check("the Edit button is hidden until hover", Number(await editBtn.evaluate((b) => getComputedStyle(b).opacity)) === 0);
+    await page.hover(".ocr-image");
+    await page.waitForTimeout(200);
+    check("hovering the image reveals Edit", Number(await editBtn.evaluate((b) => getComputedStyle(b).opacity)) === 1);
+    await editBtn.click();
+    check("Edit opens the annotation editor for that image", JSON.stringify(await callsOf("start_annotation")) === JSON.stringify([{ ids: ["img1"] }]));
+
+    // History settings: off by default, preview before deleting.
+    await page.click("text=⚙ History Settings…");
+    await page.waitForSelector(".history-settings");
+    check("retention is off by default", (await page.locator('.history-settings select[aria-label="Keep history"]').inputValue()) === "0");
+    await page.selectOption('.history-settings select[aria-label="Keep history"]', "7");
+    await page.waitForTimeout(100);
+    check("choosing a period previews what would be deleted", (await page.locator(".history-settings").textContent()).includes("Saving deletes 4 items right away"));
+    check("favorites and pinned items are kept unless chosen", (await page.locator(".history-settings").textContent()).includes("Favorites and pinned items are kept"));
+    await page.click(".history-settings >> text=Save and delete 4");
+    await page.waitForTimeout(100);
+    check("saving applies the chosen retention", JSON.stringify(await callsOf("history_retention_set")) === JSON.stringify([{ retention: { days: 7, include_favorites: false, include_pinned: false } }]));
+    await page.click(".history-settings >> text=Pause 15 min");
+    check("recording can be paused for a while", JSON.stringify(await callsOf("pause_monitoring")) === JSON.stringify([{ minutes: 15 }]) && (await page.locator(".history-settings").textContent()).includes("Paused until"));
+    await page.click(".history-settings >> text=Clear All History…");
+    check("Clear All History asks first", (await page.locator(".history-settings").textContent()).includes("including favorites and pinned"));
+    await page.keyboard.press("Escape");
+    await page.keyboard.press("Escape");
+    check("Esc closes the settings dialog", (await page.locator(".history-settings").count()) === 0 && !(await callsOf("clear_history")).length);
+    await page.close();
+  }
+
   // ---------------- Image snippets ----------------
   {
     const page = await browser.newPage({ viewport: { width: 860, height: 620 } });
@@ -390,6 +495,17 @@ function mockTauri(label) {
     await page.waitForTimeout(100);
     last = (await saves()).pop();
     check("the picked image is saved", last?.image_item === "img3" && last?.keyword === "pic", JSON.stringify(last));
+
+    // Text snippets choose what follows the text; exact is the default.
+    await page.click("text=+ New");
+    check("new snippets insert the exact text by default", (await page.locator(".snippet-form select").first().inputValue()) === "exact");
+    await page.fill(".snippet-keyword-field input", "hello");
+    await page.fill(".snippet-form textarea", "Hello World");
+    await page.selectOption(".snippet-form select", "space");
+    await page.click("text=Save");
+    await page.waitForTimeout(100);
+    last = (await saves()).pop();
+    check("the whitespace setting is saved, content untouched", last?.suffix === "space" && last?.content === "Hello World", JSON.stringify(last));
 
     // Searching snippet content never matches an image's file name.
     await page.fill("#search-input", "snip-abc");
