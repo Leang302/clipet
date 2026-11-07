@@ -60,6 +60,10 @@ pub struct SnippetStatus {
     /// paused until manually resumed.
     pub paused_until: Option<i64>,
     pub listener: ListenerState,
+    /// The app (e.g. a browser with a password field focused) that has macOS
+    /// secure input on. While it's on no app can see typing, so nothing can
+    /// expand anywhere. `None` when typing is visible.
+    pub blocked_by: Option<String>,
 }
 
 /// What the keyboard hook reads on every key press, swapped atomically as a
@@ -86,6 +90,7 @@ pub struct SnippetService {
     /// before a pause can expand after it.
     generation: AtomicU64,
     listener: AtomicU8,
+    blocked_by: Mutex<Option<String>>,
     on_status: OnceLock<Box<dyn Fn(&SnippetStatus) + Send + Sync>>,
 }
 
@@ -184,6 +189,7 @@ impl SnippetService {
             pause_changed: Condvar::new(),
             generation: AtomicU64::new(0),
             listener: AtomicU8::new(0),
+            blocked_by: Mutex::new(None),
             on_status: OnceLock::new(),
         })
     }
@@ -236,6 +242,23 @@ impl SnippetService {
         }
     }
 
+    /// Records which app holds secure input (None = nobody) and tells the
+    /// tray and the Snippets view when that changes.
+    pub(crate) fn set_blocked_by(&self, app: Option<String>) {
+        {
+            let mut current = self.blocked_by.lock().unwrap();
+            if *current == app {
+                return;
+            }
+            *current = app.clone();
+        }
+        diag(&match &app {
+            Some(name) => format!("secure input turned on by {name}: typing is hidden from all apps"),
+            None => "secure input off".to_string(),
+        });
+        self.notify();
+    }
+
     fn is_paused(&self) -> bool {
         match self.pause.load(Ordering::SeqCst) {
             0 => false,
@@ -263,6 +286,7 @@ impl SnippetService {
             paused,
             paused_until: (paused && raw > 0).then_some(raw),
             listener: ListenerState::from_u8(self.listener.load(Ordering::SeqCst)),
+            blocked_by: self.blocked_by.lock().unwrap().clone(),
         }
     }
 

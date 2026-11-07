@@ -19,7 +19,7 @@ const IS_MAC = navigator.userAgent.includes("Mac");
 export const REVEAL_LABEL = IS_MAC ? "Reveal in Finder" : "Show in Explorer";
 
 const ICONS: [string, string[]][] = [
-  ["🗜️", ["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "dmg", "iso"]],
+  ["📦", ["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "dmg", "iso"]],
   ["📊", ["xlsx", "xls", "csv", "numbers", "ods"]],
   ["📝", ["doc", "docx", "pages", "odt", "rtf", "txt", "md"]],
   ["📕", ["pdf"]],

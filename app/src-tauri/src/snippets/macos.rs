@@ -109,7 +109,52 @@ struct Shared {
     own_pid: i64,
 }
 
+/// The app holding macOS secure input, if any. Secure input is session-wide:
+/// while one app has it (normally while its password field is focused, but
+/// apps can leave it stuck on), event taps receive no keystrokes at all.
+fn secure_input_holder() -> Option<String> {
+    use core_foundation::base::TCFType;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::number::CFNumber;
+    use core_foundation::string::CFString;
+
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGSessionCopyCurrentDictionary() -> core_foundation::dictionary::CFDictionaryRef;
+    }
+    if unsafe { IsSecureEventInputEnabled() } == 0 {
+        return None;
+    }
+    let pid = unsafe {
+        let raw = CGSessionCopyCurrentDictionary();
+        if raw.is_null() {
+            None
+        } else {
+            let dict: CFDictionary<CFString, core_foundation::base::CFType> = CFDictionary::wrap_under_create_rule(raw);
+            dict.find(CFString::from_static_string("kCGSSessionSecureInputPID"))
+                .and_then(|v| v.downcast::<CFNumber>())
+                .and_then(|n| n.to_i32())
+        }
+    };
+    let name = pid
+        .and_then(objc2_app_kit::NSRunningApplication::runningApplicationWithProcessIdentifier)
+        .and_then(|app| app.localizedName())
+        .map(|n| n.to_string());
+    Some(name.unwrap_or_else(|| "another app".to_string()))
+}
+
+/// Checks secure input every 2 s, so the warning appears (and clears) on its
+/// own even though no keys reach the tap while it's on.
+fn watch_secure_input(service: Arc<SnippetService>) {
+    std::thread::spawn(move || loop {
+        let holder = secure_input_holder().filter(|name| name != "Clipet");
+        service.set_blocked_by(holder);
+        std::thread::sleep(Duration::from_secs(2));
+    });
+}
+
 pub fn start(service: Arc<SnippetService>, monitor: Arc<MonitorState>) {
+    watch_secure_input(service.clone());
     let (jobs, job_rx) = mpsc::channel::<Job>();
     let shared = Arc::new(Shared {
         service: service.clone(),

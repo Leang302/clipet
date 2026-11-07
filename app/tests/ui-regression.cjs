@@ -94,7 +94,7 @@ function mockTauri(label) {
           return saved;
         }
         case "snippet_settings_get": return { enabled: true, prefix: ";", trigger_mode: "space", escape_enabled: true, case_sensitive: true, default_pause_minutes: 15 };
-        case "snippets_status": return { enabled: true, paused: false, paused_until: null, listener: "active" };
+        case "snippets_status": return { enabled: true, paused: false, paused_until: null, listener: "active", blocked_by: window.__blockedBy ?? null };
         default: return null; // plugin:event|listen etc.
       }
     },
@@ -366,7 +366,7 @@ function mockTauri(label) {
     // A file entry: shown by name in Files, with explicit file actions.
     const fileRow = page.locator(".clip-item", { hasText: "Final Python.zip" });
     check("a file entry is listed by its name, not its stored paths", (await fileRow.count()) === 1 && !(await fileRow.textContent()).includes("["));
-    check("file entries get a file-type icon", (await fileRow.locator(".clip-thumb").textContent()).includes("🗜️"));
+    check("file entries get a file-type icon", (await fileRow.locator(".clip-thumb").textContent()).includes("📦"));
     await fileRow.click();
     await page.waitForSelector(".file-card .file-row");
     for (const label of ["Paste File", "Copy Path", "Copy File Link", "Open"]) {
@@ -495,6 +495,16 @@ function mockTauri(label) {
     await page.waitForTimeout(100);
     last = (await saves()).pop();
     check("the picked image is saved", last?.image_item === "img3" && last?.keyword === "pic", JSON.stringify(last));
+
+    // Another app's password field blocking all typing is explained, then clears.
+    check("no warning while typing is visible", !(await page.locator(".snippet-status").textContent()).includes("Blocked"));
+    await page.evaluate(() => window.__emit("clipet://snippets-status", { enabled: true, paused: false, paused_until: null, listener: "active", blocked_by: "Google Chrome" }));
+    await page.waitForTimeout(50);
+    check("a secure-input block names the app", (await page.locator(".snippet-status.warn").textContent()).includes("Blocked by Google Chrome"));
+    check("the block explains what to do", (await page.locator(".snippet-status-help").getAttribute("title")).includes("quit and reopen Google Chrome"));
+    await page.evaluate(() => window.__emit("clipet://snippets-status", { enabled: true, paused: false, paused_until: null, listener: "active", blocked_by: null }));
+    await page.waitForTimeout(50);
+    check("the warning clears when the field is left", (await page.locator(".snippet-status").textContent()).includes("Expanding as you type"));
 
     // Text snippets choose what follows the text; exact is the default.
     await page.click("text=+ New");

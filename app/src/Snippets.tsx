@@ -40,6 +40,8 @@ type SnippetStatus = {
   paused: boolean;
   paused_until: number | null;
   listener: "starting" | "active" | "needs-permission" | "unsupported";
+  /** App holding macOS secure input (a focused password field); typing is hidden from every app meanwhile. */
+  blocked_by: string | null;
 };
 
 type Draft = {
@@ -496,6 +498,19 @@ function StatusBar(props: { status: SnippetStatus | null; settings: SnippetSetti
     text = "Needs Accessibility permission to expand";
     tone = "warn";
     action = <button className="icon-btn" onClick={onOpenAccessibility}>Open</button>;
+  } else if (status.blocked_by && status.enabled && !status.paused) {
+    text = `Blocked by ${status.blocked_by}: a password field has hidden your typing`;
+    tone = "warn";
+    action = (
+      <span
+        className="snippet-status-help"
+        tabIndex={0}
+        role="note"
+        title={`macOS hides keystrokes from all apps while ${status.blocked_by} has a password field focused, so no snippet can expand anywhere. Leave or close that field (if it stays stuck, quit and reopen ${status.blocked_by}). To insert a snippet into the password field itself, select it here and press Enter.`}
+      >
+        Why?
+      </span>
+    );
   } else if (!status.enabled) {
     text = "Text expansion is off";
     tone = "muted";

@@ -1783,6 +1783,10 @@ pub fn run() {
                     (ListenerState::Unsupported, ..) => "Text Expansion: Not available on this OS".to_string(),
                     (ListenerState::NeedsPermission, ..) => "Text Expansion: Needs Accessibility".to_string(),
                     (_, false, ..) => "Text Expansion: Off".to_string(),
+                    _ if status.blocked_by.is_some() && !status.paused => format!(
+                        "Text Expansion: Blocked by {} (password field)",
+                        status.blocked_by.as_deref().unwrap_or_default()
+                    ),
                     (_, _, true, Some(until)) => {
                         let local = chrono::DateTime::from_timestamp_millis(until)
                             .map(|t| t.with_timezone(&chrono::Local).format("%H:%M").to_string())

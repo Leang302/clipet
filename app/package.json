@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "tauri:build:mac": "./scripts/build-macos.sh",
-    "test:ui": "vite build && node tests/ui-regression.cjs dist"
+    "test:ui": "vite build && node tests/ui-regression.cjs dist",
+    "screenshots": "vite build && node scripts/screenshots.cjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
