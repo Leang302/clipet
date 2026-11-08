@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { ThemeChoice } from "./theme";
+import type { OcrLanguage, OcrStatus } from "./App";
 
 export type Retention = { days: number; include_favorites: boolean; include_pinned: boolean };
 type RetentionStatus = { retention: Retention; eligible: number };
@@ -17,8 +19,13 @@ export function HistorySettings(props: {
   totalItems: number;
   onClose: () => void;
   toast: (msg: string, ms?: number) => void;
+  ocrStatus: OcrStatus | null;
+  onSetOcrEnabled: (enabled: boolean) => void;
+  onSetOcrLanguage: (language: OcrLanguage) => void;
+  theme: ThemeChoice;
+  onSetTheme: (theme: ThemeChoice) => void;
 }) {
-  const { totalItems, onClose, toast } = props;
+  const { totalItems, onClose, toast, ocrStatus, onSetOcrEnabled, onSetOcrLanguage, theme, onSetTheme } = props;
   const [saved, setSaved] = useState<RetentionStatus | null>(null);
   const [draft, setDraft] = useState<Retention | null>(null);
   const [custom, setCustom] = useState(false);
@@ -94,7 +101,43 @@ export function HistorySettings(props: {
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <div className="recovery-dialog history-settings" role="dialog" aria-modal="true" aria-labelledby="history-settings-title" onMouseDown={(e) => e.stopPropagation()}>
-        <div className="recovery-title" id="history-settings-title">History settings</div>
+        <div className="recovery-title" id="history-settings-title">Settings</div>
+
+        <section>
+          <div className="hs-row">
+            <span>Appearance</span>
+            <select aria-label="Theme" value={theme} onChange={(e) => onSetTheme(e.target.value as ThemeChoice)}>
+              <option value="system">System</option>
+              <option value="light">Light</option>
+              <option value="dark">Dark</option>
+            </select>
+          </div>
+          {ocrStatus?.supported && (
+            <>
+              <label className="hs-check">
+                <input type="checkbox" checked={ocrStatus.enabled} onChange={(e) => onSetOcrEnabled(e.target.checked)} />
+                Search text in images and screenshots
+              </label>
+              {ocrStatus.enabled && (
+                <label className="hs-row">
+                  <span>Recognize</span>
+                  <select aria-label="OCR language" value={ocrStatus.language} onChange={(e) => onSetOcrLanguage(e.target.value as OcrLanguage)}>
+                    <option value="korean-english">Korean + English</option>
+                    <option value="auto">Automatic</option>
+                    <option value="english">English</option>
+                    <option value="korean">Korean</option>
+                  </select>
+                </label>
+              )}
+              {ocrStatus.enabled && ocrStatus.pending > 0 && (
+                <p className="hs-note" role="status">Reading {ocrStatus.pending} image{ocrStatus.pending === 1 ? "" : "s"}…</p>
+              )}
+              {ocrStatus.enabled && !ocrStatus.pending && ocrStatus.updating > 0 && (
+                <p className="hs-note" role="status">Improving {ocrStatus.updating} image{ocrStatus.updating === 1 ? "" : "s"}…</p>
+              )}
+            </>
+          )}
+        </section>
 
         <section>
           <label className="hs-row">

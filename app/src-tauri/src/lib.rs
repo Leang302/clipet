@@ -46,13 +46,13 @@ struct PasteCoordinator {
 /// Where a paste goes: the app that was frontmost when the popup opened and,
 /// on macOS, its focused window (see `paste_target`).
 #[derive(Clone, Default)]
-struct PasteTarget {
-    pid: Option<i32>,
+pub(crate) struct PasteTarget {
+    pub(crate) pid: Option<i32>,
     #[cfg(target_os = "macos")]
-    window: Option<paste_target::WindowRef>,
+    pub(crate) window: Option<paste_target::WindowRef>,
     /// The text field that had focus, when the app exposes it.
     #[cfg(target_os = "macos")]
-    element: Option<paste_target::ElementRef>,
+    pub(crate) element: Option<paste_target::ElementRef>,
 }
 
 enum PreparedClipboardPayload {
@@ -791,7 +791,7 @@ fn open_accessibility_settings() -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn frontmost_application_pid() -> Option<i32> {
+pub(crate) fn frontmost_application_pid() -> Option<i32> {
     use objc2_app_kit::NSWorkspace;
 
     NSWorkspace::sharedWorkspace()
@@ -869,7 +869,7 @@ fn focus_handoff_complete(
         .unwrap_or(frontmost_pid != current_pid)
 }
 
-fn return_focus_to_previous_app(
+pub(crate) fn return_focus_to_previous_app(
     app: &tauri::AppHandle,
     paste_target: &PasteTarget,
 ) -> Result<(), String> {
@@ -1221,12 +1221,13 @@ async fn paste_snippet(
     monitor: tauri::State<'_, Arc<MonitorState>>,
     coordinator: tauri::State<'_, Arc<PasteCoordinator>>,
     id: String,
+    values: Option<std::collections::HashMap<String, String>>,
 ) -> Result<(), String> {
     let service = snippets::service(&app);
     let snippet = service
         .snippet(&id)
         .ok_or_else(|| "that snippet no longer exists".to_string())?;
-    let payload = snippet_payload(&service, &snippet)?;
+    let payload = snippet_payload(&service, &snippet, values.as_ref())?;
     let monitor = monitor.inner().clone();
     let coordinator = coordinator.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -1251,12 +1252,13 @@ fn copy_snippet(
     app: tauri::AppHandle,
     monitor: tauri::State<Arc<MonitorState>>,
     id: String,
+    values: Option<std::collections::HashMap<String, String>>,
 ) -> Result<(), String> {
     let service = snippets::service(&app);
     let snippet = service
         .snippet(&id)
         .ok_or_else(|| "that snippet no longer exists".to_string())?;
-    let payload = snippet_payload(&service, &snippet)?;
+    let payload = snippet_payload(&service, &snippet, values.as_ref())?;
     let mut system_clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
     write_prepared_payload(&mut system_clipboard, &monitor, &payload)
 }
@@ -1265,10 +1267,17 @@ fn copy_snippet(
 fn snippet_payload(
     service: &snippets::SnippetService,
     snippet: &snippets::store::Snippet,
+    values: Option<&std::collections::HashMap<String, String>>,
 ) -> Result<PreparedClipboardPayload, String> {
     let Some(png) = service.image_png(snippet) else {
         // Same text as typed expansion inserts, including its whitespace setting.
-        let content = format!("{}{}", snippet.content, snippets::store::suffix_text(&snippet.suffix));
+        let base = snippets::store::resolve_template(
+            &snippet.content,
+            &snippet.variants,
+            snippets::store::current_platform(),
+        );
+        let template = format!("{base}{}", snippets::store::suffix_text(&snippet.suffix));
+        let content = snippets::render_for_paste(&template, &snippet.parameters, values)?;
         return Ok(PreparedClipboardPayload::Text {
             hash: clipboard::hash_bytes(content.as_bytes()),
             content,
@@ -1502,7 +1511,7 @@ fn clamp_axis(start: i32, len: u32, area_start: i32, area_len: u32) -> i32 {
 
 /// Keeps the popup inside the visible area (minus menu bar and Dock / taskbar)
 /// of the screen it is mostly on, or the primary screen when it is on none.
-fn keep_on_screen(win: &tauri::WebviewWindow) {
+pub(crate) fn keep_on_screen(win: &tauri::WebviewWindow) {
     let (Ok(position), Ok(size)) = (win.outer_position(), win.outer_size()) else {
         return;
     };
@@ -1621,6 +1630,12 @@ pub fn run() {
             snippets::snippet_delete,
             snippets::snippet_set_enabled,
             snippets::snippet_duplicate,
+            snippets::snippet_preview,
+            snippets::prompt::snippet_prompt_get,
+            snippets::prompt::snippet_prompt_submit,
+            snippets::prompt::snippet_prompt_cancel,
+            snippets::transfer::snippets_export,
+            snippets::transfer::snippets_import,
             snippets::snippet_image_preview,
             snippets::snippet_settings_get,
             snippets::snippet_settings_set,
@@ -1856,6 +1871,17 @@ pub fn run() {
                         keep_on_screen_after_move(&win_clone, &last_move, &settling)
                     }
                     _ => {}
+                });
+            }
+
+            // The snippet parameter popup: clicking elsewhere cancels it and
+            // leaves the typed shortcut untouched (see snippets/prompt.rs).
+            if let Some(win) = app.get_webview_window(snippets::prompt::WINDOW_LABEL) {
+                let handle = app.handle().clone();
+                win.on_window_event(move |event| {
+                    if let tauri::WindowEvent::Focused(false) = event {
+                        snippets::service(&handle).cancel_prompt_on_blur();
+                    }
                 });
             }
 

@@ -81,11 +81,14 @@ Destination applications still decide which pasteboard items and formats they ac
 
 ## Smart Snippets
 
-- `src-tauri/src/snippets/engine.rs` is the platform-independent core. It tracks the current word and decides Pass / Expand / Escape, synchronously, when Space or Tab arrives. It is fully unit-tested.
-- `snippets/store.rs` keeps snippets and their settings in a **separate `snippets.sqlite3`**, so no history, cache or image cleanup can delete them. Schema changes go through `PRAGMA user_version` migrations.
-- `snippets/mod.rs` (`SnippetService`) holds the live index, swapped atomically on every change. It also owns the pause state (an atomic wall-clock deadline, a timer thread for the tray, and a generation counter so the hook drops half-typed words), plus the Tauri commands.
-- `snippets/macos.rs` is the native layer: a session `CGEventTap` thread, a replacement worker, and main-thread injection via enigo. Injected events carry `EVENT_SOURCE_USER_DATA` marks so the tap ignores them. Keys typed during a replacement are held and replayed in order.
-- Windows has no backend yet. That will need a `WH_KEYBOARD_LL` hook behind the same `SnippetService` interface; until then the listener reports `unsupported`.
+- `src-tauri/src/snippets/engine.rs` is the platform-independent core. It tracks the text left of the caret and decides Pass / Expand / Escape / Prompt, synchronously, when Space or Tab arrives. Static snippets match the trailing word exactly as before; a snippet with parameters completes only on Tab, either from inline args (`;killport 5173`, found by a bounded backward scan) or by asking for missing values (`Prompt`). It is fully unit-tested.
+- `snippets/params.rs` is pure parameter logic: `{{name}}` parsing (with `\{{literal}}` escapes), argument tokenizing (quotes, `\"`, `\\`), per-type validation (text/integer/url/date/dropdown) and literal-substitution rendering. It never evaluates or executes anything.
+- `snippets/store.rs` keeps snippets and their settings in a **separate `snippets.sqlite3`**, so no history, cache or image cleanup can delete them. Schema changes go through `PRAGMA user_version` migrations (v3 adds `parameters`, v4 adds per-OS `variants`; old rows read back as static, single-template snippets).
+- `snippets/mod.rs` (`SnippetService`) holds the live index (each snippet's template for the current OS), swapped atomically on every change. It also owns the pause state (an atomic wall-clock deadline, a timer thread for the tray, and a generation counter so the hook drops half-typed words), plus the Tauri commands. `snippet_save` rejects parameter configs that don't match the template's placeholders, and variants that don't use the same parameters.
+- `snippets/prompt.rs` runs the missing-parameter popup (`prompt` window): one pending request at a time, identified by a token so it completes or cancels once. See `docs/factory/progress.md` for the insertion safety rules.
+- `snippets/macos.rs` is the native layer: a session `CGEventTap` thread, a replacement worker, and main-thread injection via enigo. Injected events carry `EVENT_SOURCE_USER_DATA` marks so the tap ignores them. Keys typed during a replacement are held and replayed in order. A popup confirmation reuses the paste handoff (`return_focus_to_previous_app`) and inserts only after re-confirming the app, the focused field and the text before the caret.
+- `snippets/windows.rs` is the `WH_KEYBOARD_LL` hook behind the same interface. It expands static and inline-argument snippets and opens the parameter popup; a confirmation re-activates the captured window and inserts only if the same control still has focus (Windows can't read the text before the caret in general).
+- `snippets/transfer.rs` exports text snippets to a versioned JSON file and imports such files, validating every record with the editor's rules and never overwriting an existing snippet.
 
 ## Known gaps (tracked, not hidden)
 

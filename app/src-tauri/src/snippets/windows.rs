@@ -191,6 +191,81 @@ unsafe extern "system" {
     fn GetClipboardData(format: u32) -> Handle;
     fn SetClipboardData(format: u32, data: Handle) -> Handle;
     fn GetClipboardSequenceNumber() -> u32;
+    fn SetForegroundWindow(hwnd: Handle) -> i32;
+    fn IsWindow(hwnd: Handle) -> i32;
+    fn GetGUIThreadInfo(thread_id: u32, info: *mut GuiThreadInfo) -> i32;
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+struct Rect {
+    left: i32,
+    top: i32,
+    right: i32,
+    bottom: i32,
+}
+
+#[repr(C)]
+#[allow(dead_code)]
+struct GuiThreadInfo {
+    size: u32,
+    flags: u32,
+    active: Handle,
+    focus: Handle,
+    capture: Handle,
+    menu_owner: Handle,
+    move_size: Handle,
+    caret: Handle,
+    caret_rect: Rect,
+}
+
+/// The window a popup request came from: the foreground top-level window and
+/// the control inside it with keyboard focus (`0` when unknown). Stored as
+/// integers — window handles are plain identifiers, valid from any thread.
+#[derive(Clone, Copy)]
+pub struct WinTarget {
+    hwnd: isize,
+    focus: isize,
+}
+
+/// The control with keyboard focus in the thread that owns `hwnd`.
+fn focused_control(hwnd: Handle) -> isize {
+    unsafe {
+        let thread = GetWindowThreadProcessId(hwnd, std::ptr::null_mut());
+        let mut info: GuiThreadInfo = std::mem::zeroed();
+        info.size = std::mem::size_of::<GuiThreadInfo>() as u32;
+        if GetGUIThreadInfo(thread, &mut info) == 0 {
+            return 0;
+        }
+        info.focus as isize
+    }
+}
+
+fn capture_target() -> WinTarget {
+    let hwnd = unsafe { GetForegroundWindow() };
+    WinTarget {
+        hwnd: hwnd as isize,
+        focus: focused_control(hwnd),
+    }
+}
+
+/// Makes the captured window the foreground window again and waits up to
+/// 500 ms for Windows to confirm. Clipet just received the user's Enter/Esc,
+/// so Windows lets it hand the foreground away.
+pub(super) fn restore_focus(target: &WinTarget) -> Result<(), String> {
+    let hwnd = target.hwnd as Handle;
+    if hwnd.is_null() || unsafe { IsWindow(hwnd) } == 0 {
+        return Err("The window you were typing in was closed, so nothing was inserted.".to_string());
+    }
+    unsafe { SetForegroundWindow(hwnd) };
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        if unsafe { GetForegroundWindow() } == hwnd {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    Err("Couldn't return to the window you were typing in, so nothing was inserted.".to_string())
 }
 
 #[link(name = "kernel32")]
@@ -410,6 +485,7 @@ fn on_key(shared: &Shared, info: &KbdLlHookStruct) -> bool {
                 Decision::Expand { .. } => "expand",
                 Decision::ExpandImage { .. } => "expand image",
                 Decision::Escape { .. } => "escape",
+                Decision::Prompt { .. } => "prompt",
             },
             if replay { ", replayed" } else { "" },
             if previous_pid != target_pid { ", target changed" } else { "" },
@@ -565,6 +641,15 @@ fn run_job(shared: &Shared, monitor: &Arc<MonitorState>, job: Job) {
         trigger,
         verify_boundary,
     } = job;
+    let decision = match decision {
+        Decision::Prompt {
+            snippet_id,
+            delete_chars,
+            prefill,
+            typed,
+        } => return open_prompt(shared, snippet_id, delete_chars, typed, prefill, trigger),
+        other => other,
+    };
     let (delete_chars, insert, snippet_id) = match decision {
         Decision::Expand {
             snippet_id,
@@ -595,6 +680,7 @@ fn run_job(shared: &Shared, monitor: &Arc<MonitorState>, job: Job) {
             insert,
         } => (delete_chars, Some(Insert::Text(insert)), None),
         Decision::Pass => (0, Some(Insert::Text(String::new())), None),
+        Decision::Prompt { .. } => unreachable!("handled above"),
     };
     let Some(insert) = insert else {
         shared.engine.lock().unwrap().reset();
@@ -632,6 +718,65 @@ fn run_job(shared: &Shared, monitor: &Arc<MonitorState>, job: Job) {
             replay_trigger(trigger);
             release_held(shared);
         }
+    }
+}
+
+/// A parameterized snippet still needs values: remember the window and the
+/// control it was typed in and open the popup. The invocation stays untouched
+/// until the user confirms (`complete_prompt`); the Tab is consumed.
+fn open_prompt(
+    shared: &Shared,
+    snippet_id: String,
+    delete_chars: usize,
+    typed: String,
+    prefill: std::collections::HashMap<String, String>,
+    trigger: KeyEvent,
+) {
+    let target = capture_target();
+    super::diag(&format!(
+        "prompt: opening for {delete_chars} typed chars (focused control {})",
+        if target.focus != 0 { "known" } else { "unknown" }
+    ));
+    shared.engine.lock().unwrap().reset();
+    // Keys typed right after Tab still belong to that window; deliver them
+    // before the popup takes focus.
+    release_held(shared);
+    if !shared.service.open_prompt(snippet_id, delete_chars, typed, prefill, target) {
+        super::diag("prompt: window unavailable; delivering Tab");
+        replay_trigger(trigger);
+    }
+}
+
+/// Finishes a confirmed popup request: brings back the window the shortcut
+/// was typed in and, only if the same control still has focus, replaces the
+/// invocation with `text`. Windows offers no general way to read the text
+/// before the caret, so the window and focused control are what's checked.
+pub(super) fn complete_prompt(
+    monitor: &Arc<MonitorState>,
+    pending: super::prompt::PendingPrompt,
+    text: &str,
+) -> Result<(), String> {
+    let shared = SHARED
+        .get()
+        .ok_or_else(|| "the keyboard listener isn't running; nothing was inserted".to_string())?;
+    restore_focus(&pending.target)?;
+    if pending.target.focus != 0 && focused_control(pending.target.hwnd as Handle) != pending.target.focus {
+        return Err("The text field you were typing in no longer has focus, so nothing was inserted.".to_string());
+    }
+    *shared.held.lock().unwrap() = Some(Vec::new());
+    let outcome = replace(monitor, false, pending.delete_chars, &Insert::Text(text.to_string()));
+    // Whatever happened, the engine no longer knows the text at the caret.
+    shared.engine.lock().unwrap().reset();
+    release_held(shared);
+    match outcome {
+        Outcome::Done { restore } => {
+            if let Some(restore) = restore {
+                std::thread::sleep(CLIPBOARD_RESTORE_DELAY);
+                restore.apply();
+            }
+            Ok(())
+        }
+        Outcome::Skipped(reason) => Err(format!("Nothing was inserted: {reason}.")),
     }
 }
 

@@ -1,6 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import {
+  Layers, Star, Type as TypeIcon, Image as ImageIcon, Monitor, Link as LinkIcon,
+  File as FileIconLucide, Code2, Scissors, Trash2, Settings2, ClipboardPaste, Pencil, Pin, Maximize2, Check,
+  type LucideIcon,
+} from "lucide-react";
 import { applyTheme, loadTheme, saveTheme, THEME_STORAGE_KEY, type ThemeChoice } from "./theme";
 import { SnippetsView, type SnippetSeed } from "./Snippets";
 import { lineMatches, matchItem, type SearchMatch } from "./search";
@@ -8,6 +13,8 @@ import { installPopupDrag } from "./popupDrag";
 import { FileCard, fileItemIcon } from "./FileCard";
 import { TextViewer, isLongText, countLines, PREVIEW_CHARS } from "./TextViewer";
 import { HistorySettings } from "./HistorySettings";
+import { Tooltip } from "./Tooltip";
+import { SearchField } from "./SearchField";
 import "./clipflow.css";
 
 type ClipItem = {
@@ -29,8 +36,8 @@ type ClipItem = {
 };
 
 type OcrLine = { text: string; x: number; y: number; w: number; h: number };
-type OcrLanguage = "auto" | "korean-english" | "english" | "korean";
-type OcrStatus = {
+export type OcrLanguage = "auto" | "korean-english" | "english" | "korean";
+export type OcrStatus = {
   supported: boolean;
   enabled: boolean;
   language: OcrLanguage;
@@ -56,25 +63,48 @@ type PasteRecovery = {
 const MANUAL_PASTE_READY_PREFIX = "CLIPET_MANUAL_PASTE_READY:";
 const AUTO_PASTE_BLOCKED_PREFIX = "CLIPET_AUTO_PASTE_BLOCKED:";
 
-const TYPE_META: Record<string, { icon: string; label: string }> = {
-  text: { icon: "📝", label: "Text" },
-  link: { icon: "🔗", label: "Link" },
-  image: { icon: "🖼️", label: "Image" },
-  screenshot: { icon: "🖥️", label: "Screenshot" },
-  file: { icon: "📄", label: "File" },
-  code: { icon: "⌨️", label: "Code" },
+const TYPE_META: Record<string, { icon: LucideIcon; label: string }> = {
+  text: { icon: TypeIcon, label: "Text" },
+  link: { icon: LinkIcon, label: "Link" },
+  image: { icon: ImageIcon, label: "Image" },
+  screenshot: { icon: Monitor, label: "Screenshot" },
+  file: { icon: FileIconLucide, label: "File" },
+  code: { icon: Code2, label: "Code" },
 };
 
-const CATEGORIES = [
-  { key: "all", icon: "🗂️", label: "All History" },
-  { key: "favorites", icon: "⭐", label: "Favorites" },
-  { key: "text", icon: "📝", label: "Text" },
-  { key: "image", icon: "🖼️", label: "Images" },
-  { key: "screenshot", icon: "🖥️", label: "Screenshots" },
-  { key: "link", icon: "🔗", label: "Links" },
-  { key: "file", icon: "📄", label: "Files" },
-  { key: "code", icon: "⌨️", label: "Code" },
+/** Leading icon inside a labeled button. */
+const BTN_ICON = { size: 13, strokeWidth: 1.9, "aria-hidden": true } as const;
+
+const CATEGORIES: { key: string; icon: LucideIcon; label: string }[] = [
+  { key: "all", icon: Layers, label: "All History" },
+  { key: "favorites", icon: Star, label: "Favorites" },
+  { key: "text", icon: TypeIcon, label: "Text" },
+  { key: "image", icon: ImageIcon, label: "Images" },
+  { key: "screenshot", icon: Monitor, label: "Screenshots" },
+  { key: "link", icon: LinkIcon, label: "Links" },
+  { key: "file", icon: FileIconLucide, label: "Files" },
+  { key: "code", icon: Code2, label: "Code" },
 ];
+
+/** One 20-22px outline icon in the nav rail, with a tooltip label and a
+ * restrained active/hover state (spec Part B1) — no decorative emoji. */
+function NavIcon(props: { icon: LucideIcon; label: string; active?: boolean; disabled?: boolean; onClick: () => void }) {
+  const { icon: Icon, label, active, disabled, onClick } = props;
+  return (
+    <Tooltip label={label}>
+      <button
+        type="button"
+        className={"nav-icon" + (active ? " active" : "")}
+        aria-label={label}
+        aria-current={active ? "page" : undefined}
+        disabled={disabled}
+        onClick={onClick}
+      >
+        <Icon size={17} strokeWidth={1.8} aria-hidden="true" />
+      </button>
+    </Tooltip>
+  );
+}
 
 function timeAgo(ts: number): string {
   const s = Math.floor((Date.now() - ts) / 1000);
@@ -408,12 +438,12 @@ export default function App() {
     }
   }
 
-  async function pasteSnippet(id: string) {
+  async function pasteSnippet(id: string, values?: Record<string, string>) {
     if (pasteInFlightRef.current) return;
     pasteInFlightRef.current = true;
     setIsPasting(true);
     try {
-      await invoke("paste_snippet", { id });
+      await invoke("paste_snippet", { id, values: values ?? null });
       toast("Pasted");
     } catch (e) {
       handlePasteFailure(e, []);
@@ -636,81 +666,30 @@ export default function App() {
   return (
     <div id="clip-popup" className={viewerItem ? "reading" : undefined}>
       <div className="popup-body">
-        <div id="sidebar">
-          {CATEGORIES.map((c) => {
-            const count = c.key === "all" ? items.length
-              : c.key === "favorites" ? items.filter((i) => i.favorite).length
-              : items.filter((i) => i.kind === c.key).length;
-            return (
-              <div
-                key={c.key}
-                className={"sidebar-item" + (category === c.key ? " active" : "")}
-                onClick={() => setCategory(c.key)}
-              >
-                <span className="icon">{c.icon}</span>
-                <span>{c.label}</span>
-                <span className="count">{count}</span>
-              </div>
-            );
-          })}
-          <div className="sidebar-divider" />
-          <div
-            className={"sidebar-item" + (category === "snippets" ? " active" : "")}
-            onClick={() => setCategory("snippets")}
-          >
-            <span className="icon">✂️</span>
-            <span>Snippets</span>
+        <nav id="sidebar" aria-label="Categories">
+          <div className="nav-icons">
+            {CATEGORIES.map((c) => {
+              const count = c.key === "all" ? items.length
+                : c.key === "favorites" ? items.filter((i) => i.favorite).length
+                : items.filter((i) => i.kind === c.key).length;
+              return (
+                <NavIcon
+                  key={c.key}
+                  icon={c.icon}
+                  label={count > 0 ? `${c.label} (${count})` : c.label}
+                  active={category === c.key}
+                  onClick={() => setCategory(c.key)}
+                />
+              );
+            })}
+            <div className="sidebar-divider" />
+            <NavIcon icon={Scissors} label="Snippets" active={category === "snippets"} onClick={() => setCategory("snippets")} />
           </div>
-          <button
-            className="icon-btn"
-            style={{ width: "100%", marginTop: 10 }}
-            title="Deletes everything except favorites and pinned items"
-            disabled={isPasting}
-            onClick={requestClearNonFavorites}
-          >
-            🗑 Clear
-          </button>
-          <button
-            className="icon-btn"
-            style={{ width: "100%", marginTop: 6 }}
-            title="Automatic cleanup, pausing recording, clearing everything"
-            onClick={() => setShowHistorySettings(true)}
-          >
-            ⚙ History Settings…
-          </button>
-          {ocrStatus?.supported && (
-            <label className="sidebar-setting" title="Reads text in screenshots and images on this device, so search can find them">
-              <input type="checkbox" checked={ocrStatus.enabled} onChange={(e) => setOcrEnabled(e.target.checked)} />
-              <span>
-                Search text in images
-                {ocrStatus.enabled && ocrStatus.pending > 0 && <small>Reading {ocrStatus.pending} image{ocrStatus.pending === 1 ? "" : "s"}…</small>}
-                {ocrStatus.enabled && !ocrStatus.pending && ocrStatus.updating > 0 && <small>Improving {ocrStatus.updating} image{ocrStatus.updating === 1 ? "" : "s"}…</small>}
-              </span>
-            </label>
-          )}
-          {ocrStatus?.supported && ocrStatus.enabled && (
-            <select
-              className="sidebar-select"
-              title="Languages to recognize in images"
-              value={ocrStatus.language}
-              onChange={(e) => setOcrLanguage(e.target.value as OcrLanguage)}
-            >
-              <option value="korean-english">Text: Korean + English</option>
-              <option value="auto">Text: Automatic</option>
-              <option value="english">Text: English</option>
-              <option value="korean">Text: Korean</option>
-            </select>
-          )}
-          <select
-            value={theme}
-            onChange={(e) => { const t = e.target.value as ThemeChoice; setTheme(t); saveTheme(t); }}
-            style={{ width: "100%", marginTop: 8, fontSize: 12, padding: "5px 6px", borderRadius: 6, border: "1px solid var(--border-strong)", background: "var(--bg-panel)", color: "var(--text-main)" }}
-          >
-            <option value="system">Theme: System</option>
-            <option value="light">Theme: Light</option>
-            <option value="dark">Theme: Dark</option>
-          </select>
-        </div>
+          <div className="nav-icons bottom">
+            <NavIcon icon={Trash2} label="Clear History" disabled={isPasting} onClick={requestClearNonFavorites} />
+            <NavIcon icon={Settings2} label="Settings" onClick={() => setShowHistorySettings(true)} />
+          </div>
+        </nav>
 
         {category === "snippets" && (
           <SnippetsView
@@ -726,14 +705,8 @@ export default function App() {
         {category !== "snippets" && <>
         <div id="list-panel">
           <div id="search-row">
-            <input
-              ref={searchRef}
-              id="search-input"
-              placeholder="Search clipboard history…"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-            />
-            <select id="sort-select" value={sort} onChange={(e) => setSort(e.target.value as typeof sort)}>
+            <SearchField inputRef={searchRef} value={query} onChange={setQuery} placeholder="Search…" />
+            <select id="sort-select" aria-label="Sort" value={sort} onChange={(e) => setSort(e.target.value as typeof sort)}>
               <option value="newest">Newest</option>
               <option value="oldest">Oldest</option>
               <option value="frequent">Most used</option>
@@ -754,7 +727,7 @@ export default function App() {
               <div id="empty-list">No items match {query ? "your search" : "this filter"}.</div>
             )}
             {visible.map((item) => {
-              const meta = TYPE_META[item.kind] ?? { icon: "📋", label: item.kind };
+              const meta = TYPE_META[item.kind] ?? { icon: Layers, label: item.kind };
               const thumb = thumbUrls[item.id];
               const selected = selectedIds.has(item.id);
               return (
@@ -773,12 +746,18 @@ export default function App() {
                     setContextMenu({ x: e.clientX, y: e.clientY, item });
                   }}
                 >
-                  <div className="clip-thumb">{thumb ? <img src={thumb} alt="" draggable={false} /> : <span>{item.kind === "file" ? fileItemIcon(item.content) : meta.icon}</span>}</div>
+                  <div className="clip-thumb">
+                    {thumb
+                      ? <img src={thumb} alt="" draggable={false} />
+                      : item.kind === "file"
+                        ? <span>{fileItemIcon(item.content)}</span>
+                        : <meta.icon size={16} strokeWidth={1.75} aria-hidden="true" />}
+                  </div>
                   <div className="clip-meta">
                     <div className="clip-title">{previewLabel(item)}</div>
                     <div className="clip-sub">
-                      {item.pinned && <span>📌</span>}
-                      {item.favorite && <span>★</span>}
+                      {item.pinned && <Pin size={11} strokeWidth={2} className="clip-marker" aria-label="Pinned" />}
+                      {item.favorite && <Star size={11} strokeWidth={2} fill="currentColor" className="clip-marker star" aria-label="Favorite" />}
                       <span>{meta.label}</span>
                       <span>·</span>
                       <span>{timeAgo(item.created_at)}</span>
@@ -786,7 +765,7 @@ export default function App() {
                       {queryMatchesOcrOnly(item) && <span className="ocr-chip">text in image</span>}
                     </div>
                   </div>
-                  {multi && <div className="clip-check">{selected ? "✓" : ""}</div>}
+                  {multi && <div className="clip-check">{selected && <Check size={12} strokeWidth={2.5} aria-hidden="true" />}</div>}
                 </div>
               );
             })}
@@ -846,7 +825,7 @@ export default function App() {
                           disabled={isPasting}
                           onClick={() => openEditor([item.id])}
                         >
-                          ✎ Edit
+                          <Pencil {...BTN_ICON} />Edit
                         </button>
                         {/* Highlight the lines of recognized text that match the search. */}
                         {q && parseOcrLines(item)
@@ -884,7 +863,7 @@ export default function App() {
                     {isLongText(item.content) && (
                       <div className="expand-row">
                         <span className="card-caption">{item.content.length.toLocaleString()} characters · {countLines(item.content).toLocaleString()} lines</span>
-                        <button className="icon-btn" title="Read, search and edit the full text" onClick={() => setViewerId(item.id)}>⤢ Expand</button>
+                        <button className="icon-btn" title="Read, search and edit the full text" onClick={() => setViewerId(item.id)}><Maximize2 {...BTN_ICON} />Expand</button>
                       </div>
                     )}
                   </>
@@ -899,21 +878,26 @@ export default function App() {
                   <FileCard key={item.id} id={item.id} isPasting={isPasting} onPaste={() => pasteOne(item.id)} toast={toast} />
                 )}
                 {item.edited && <div className="card-caption">edited</div>}
-                <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
-                  {(item.kind === "image" || item.kind === "screenshot") && (
-                    <button className="icon-btn" disabled={isPasting} onClick={() => openEditor([item.id])}>✎ Edit</button>
-                  )}
-                  <button className="icon-btn" onClick={() => toggleFavorite(item)}>{item.favorite ? "★ Favorited" : "☆ Favorite"}</button>
-                  <button className="icon-btn" onClick={() => togglePinned(item)}>{item.pinned ? "📌 Pinned" : "Pin"}</button>
-                  {(isTextual(item) || isImage(item)) && (
-                    <button className="icon-btn" onClick={() => createSnippetFrom(item)}>✂️ Snippet</button>
-                  )}
+                <div className="detail-actions">
                   {item.kind !== "file" && (
-                    <button className="icon-btn" disabled={isPasting} onClick={() => pasteOne(item.id)}>
-                      {isPasting ? "Pasting…" : "Paste"}
+                    <button className="icon-btn primary" disabled={isPasting} onClick={() => pasteOne(item.id)}>
+                      <ClipboardPaste {...BTN_ICON} />{isPasting ? "Pasting…" : "Paste"}
                     </button>
                   )}
-                  <button className="icon-btn danger" disabled={isPasting} onClick={() => removeItem(item)}>Delete</button>
+                  {(item.kind === "image" || item.kind === "screenshot") && (
+                    <button className="icon-btn" disabled={isPasting} onClick={() => openEditor([item.id])}><Pencil {...BTN_ICON} />Edit</button>
+                  )}
+                  <button className="icon-btn" aria-pressed={item.favorite} onClick={() => toggleFavorite(item)}>
+                    <Star {...BTN_ICON} fill={item.favorite ? "currentColor" : "none"} />{item.favorite ? "Favorited" : "Favorite"}
+                  </button>
+                  <button className="icon-btn" aria-pressed={item.pinned} onClick={() => togglePinned(item)}>
+                    <Pin {...BTN_ICON} fill={item.pinned ? "currentColor" : "none"} />{item.pinned ? "Pinned" : "Pin"}
+                  </button>
+                  {(isTextual(item) || isImage(item)) && (
+                    <button className="icon-btn" onClick={() => createSnippetFrom(item)}><Scissors {...BTN_ICON} />Snippet</button>
+                  )}
+                  <span className="spacer" />
+                  <button className="icon-btn danger" disabled={isPasting} onClick={() => removeItem(item)}><Trash2 {...BTN_ICON} />Delete</button>
                 </div>
               </div>
             ))}
@@ -931,7 +915,7 @@ export default function App() {
             onMouseDown={(e) => e.stopPropagation()}
           >
             {(isTextual(contextMenu.item) || isImage(contextMenu.item)) && (
-              <button onClick={() => createSnippetFrom(contextMenu.item)}>✂️ Create Snippet…</button>
+              <button onClick={() => createSnippetFrom(contextMenu.item)}>Create Snippet…</button>
             )}
             <button disabled={isPasting} onClick={() => { const id = contextMenu.item.id; setContextMenu(null); pasteOne(id); }}>Paste</button>
             {isImage(contextMenu.item) && ocrStatus?.enabled && (
@@ -977,7 +961,16 @@ export default function App() {
       <div id="toast" className={toastMsg ? "show" : ""}>{toastMsg}</div>
 
       {showHistorySettings && (
-        <HistorySettings totalItems={items.length} onClose={() => setShowHistorySettings(false)} toast={toast} />
+        <HistorySettings
+          totalItems={items.length}
+          onClose={() => setShowHistorySettings(false)}
+          toast={toast}
+          ocrStatus={ocrStatus}
+          onSetOcrEnabled={setOcrEnabled}
+          onSetOcrLanguage={setOcrLanguage}
+          theme={theme}
+          onSetTheme={(t) => { setTheme(t); saveTheme(t); }}
+        />
       )}
 
       {confirmClear && (

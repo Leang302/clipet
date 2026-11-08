@@ -7,6 +7,7 @@
 //! current word even after Backspace — and decides synchronously (inside the
 //! hook) whether the trigger key must be swallowed and replaced.
 
+use super::params::{self, Parameter};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 
@@ -63,6 +64,10 @@ pub struct IndexedSnippet {
     pub content: String,
     /// An image snippet: `content` is unused and the hook pastes the image.
     pub image: bool,
+    /// Empty for a static snippet (expands exactly as saved, unchanged
+    /// behavior). Non-empty makes `content` a `{{name}}` template that only
+    /// Tab (never Space) can complete or prompt for — see `evaluate`.
+    pub parameters: Vec<Parameter>,
 }
 
 /// Enabled snippets keyed by keyword (the trigger without its prefix), lower-
@@ -134,6 +139,23 @@ pub enum Decision {
     },
     /// Same mechanics as `Expand`, for `;;text` → `;text`.
     Escape { delete_chars: usize, insert: String },
+    /// Swallow the trigger key and erase `delete_chars` characters (the
+    /// whole invocation: prefix, keyword, and any args already typed), then
+    /// open the parameter popup for `snippet_id`, prefilled with whatever
+    /// positional args were already typed (by parameter name). Produced
+    /// when a parameterized snippet is missing a required value, got an
+    /// invalid one, or got too many positional arguments — the popup
+    /// re-validates and reports the specific problem rather than the engine
+    /// guessing at UI text.
+    Prompt {
+        snippet_id: String,
+        delete_chars: usize,
+        prefill: HashMap<String, String>,
+        /// The exact invocation text (`delete_chars` long, ASCII) that will be
+        /// replaced — kept in memory only, never logged — so the insertion
+        /// can confirm the field still ends with it after focus returns.
+        typed: String,
+    },
 }
 
 impl Decision {
@@ -255,8 +277,10 @@ impl Engine {
                             self.push(ch);
                         }
                     }
-                    // The text around a pasted image is unknown.
-                    Decision::ExpandImage { .. } => self.reset(),
+                    // The text around a pasted image is unknown, and so is
+                    // whatever the popup will eventually do (insert or the
+                    // user cancels) for `Prompt`.
+                    Decision::ExpandImage { .. } | Decision::Prompt { .. } => self.reset(),
                 }
                 decision
             }
@@ -269,42 +293,159 @@ impl Engine {
             return Decision::Pass;
         }
         let word: String = self.line.iter().skip(self.line.len() - word_chars).collect();
-        // Replacement erases the word with one Backspace per character. That
-        // is only exact for single-code-point characters; combining marks
-        // (Khmer, Hangul jamo, accents) can erase differently per app, so such
-        // words are left untouched rather than risk corrupting the text.
-        if !word.is_ascii() {
-            return Decision::Pass;
-        }
-        let trailing = if key == TriggerKey::Space { " " } else { "" };
         let prefix = config.prefix;
-        let Some(after_prefix) = word.strip_prefix(prefix) else {
-            return Decision::Pass;
-        };
+        let trailing = if key == TriggerKey::Space { " " } else { "" };
 
-        if let Some(escaped) = after_prefix.strip_prefix(prefix) {
-            // `;;text` is either an escape or plain text; it never expands.
-            if config.escape_enabled && !escaped.is_empty() {
-                return Decision::Escape {
-                    delete_chars: word_chars,
-                    insert: format!("{after_prefix}{trailing}"),
-                };
+        // Replacement erases matched text with one Backspace per character.
+        // That is only exact for single-code-point characters; combining
+        // marks (Khmer, Hangul jamo, accents) can erase differently per app,
+        // so such text is left untouched rather than risk corrupting it.
+        if word.is_ascii() {
+            if let Some(after_prefix) = word.strip_prefix(prefix) {
+                if let Some(escaped) = after_prefix.strip_prefix(prefix) {
+                    // `;;text` is either an escape or plain text; it never expands.
+                    if config.escape_enabled && !escaped.is_empty() {
+                        return Decision::Escape {
+                            delete_chars: word_chars,
+                            insert: format!("{after_prefix}{trailing}"),
+                        };
+                    }
+                    return Decision::Pass;
+                }
+
+                match index.lookup(after_prefix) {
+                    Some(snippet) if snippet.image => {
+                        return Decision::ExpandImage {
+                            snippet_id: snippet.id.clone(),
+                            delete_chars: word_chars,
+                        }
+                    }
+                    // A parameterized snippet typed with no args yet: Tab
+                    // either fills in from defaults alone or opens the popup.
+                    // Space never triggers it (Part D3: Tab is the reliable
+                    // delimiter for parameterized snippets; this also keeps
+                    // "type a word, hit space" sentences from expanding one).
+                    Some(snippet) if !snippet.parameters.is_empty() => {
+                        return if key == TriggerKey::Tab {
+                            build_param_decision(snippet, &word, "")
+                        } else {
+                            Decision::Pass
+                        };
+                    }
+                    Some(snippet) => {
+                        return Decision::Expand {
+                            snippet_id: snippet.id.clone(),
+                            delete_chars: word_chars,
+                            insert: snippet.content.clone(),
+                        }
+                    }
+                    // Falls through: the trailing word alone isn't a known
+                    // keyword, but on Tab it might be the tail end of
+                    // `;keyword arg1 arg2` — checked below.
+                    None => {}
+                }
             }
-            return Decision::Pass;
         }
 
-        match index.lookup(after_prefix) {
-            Some(snippet) if snippet.image => Decision::ExpandImage {
-                snippet_id: snippet.id.clone(),
-                delete_chars: word_chars,
-            },
-            Some(snippet) => Decision::Expand {
-                snippet_id: snippet.id.clone(),
-                delete_chars: word_chars,
-                insert: snippet.content.clone(),
-            },
-            None => Decision::Pass,
+        // Backward scan for `;keyword <already-typed args>` ending at the
+        // caret. Only engaged for Tab, and only acted on when the matched
+        // snippet actually declares parameters, so plain static snippets
+        // keep matching only the single trailing word exactly as before.
+        if key == TriggerKey::Tab {
+            if let Some((delete_chars, keyword, raw_args)) = find_invocation(&self.line, prefix) {
+                if let Some(snippet) = index.lookup(&keyword) {
+                    if !snippet.parameters.is_empty() && raw_args.is_ascii() {
+                        let typed: String = self.line.iter().skip(self.line.len() - delete_chars).collect();
+                        return build_param_decision(snippet, &typed, &raw_args);
+                    }
+                }
+            }
         }
+
+        Decision::Pass
+    }
+}
+
+/// Looks backward through `line` for the most recent token starting with
+/// `prefix` (preceded by start-of-line or whitespace) that looks like a
+/// valid keyword, and returns how many trailing characters it plus
+/// everything typed after it spans, the keyword itself (without the
+/// prefix), and the raw text typed after it (potential arguments,
+/// unparsed — quoting is resolved later by `params::tokenize_arguments`).
+fn find_invocation(line: &VecDeque<char>, prefix: char) -> Option<(usize, String, String)> {
+    let chars: Vec<char> = line.iter().copied().collect();
+    let mut i = 0;
+    let mut best_start = None;
+    while i < chars.len() {
+        while i < chars.len() && chars[i].is_whitespace() {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        let start = i;
+        while i < chars.len() && !chars[i].is_whitespace() {
+            i += 1;
+        }
+        if chars[start] == prefix {
+            let rest = &chars[start + 1..i];
+            let valid = !rest.is_empty()
+                && rest.len() <= MAX_KEYWORD_CHARS
+                && rest
+                    .iter()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+            if valid {
+                best_start = Some(start); // keep the rightmost match
+            }
+        }
+    }
+    let start = best_start?;
+    let mut keyword_end = start + 1;
+    while keyword_end < chars.len() && !chars[keyword_end].is_whitespace() {
+        keyword_end += 1;
+    }
+    let keyword: String = chars[start + 1..keyword_end].iter().collect();
+    let raw_args: String = chars[keyword_end..].iter().collect();
+    let delete_chars = chars.len() - start;
+    Some((delete_chars, keyword, raw_args))
+}
+
+/// Turns a matched parameterized snippet plus whatever argument text was
+/// already typed into either a ready-to-insert `Expand` (every value
+/// present and valid) or a `Prompt` to open the popup — never a partial or
+/// guessed-at insertion. Malformed template configuration fails safe to
+/// `Pass` rather than inserting something wrong (Part D4).
+fn build_param_decision(snippet: &IndexedSnippet, typed: &str, raw_args: &str) -> Decision {
+    if params::placeholders_in_order(&snippet.content).is_err() {
+        return Decision::Pass;
+    }
+    let delete_chars = typed.chars().count();
+    // Positional args follow the configured parameter order rather than this
+    // template's placeholder order, so `;cmd a b` fills the same parameters
+    // whichever per-OS variant is active.
+    let order: Vec<String> = snippet.parameters.iter().map(|p| p.name.clone()).collect();
+    let prefill_on_error = |supplied: HashMap<String, String>| Decision::Prompt {
+        snippet_id: snippet.id.clone(),
+        delete_chars,
+        prefill: supplied,
+        typed: typed.to_string(),
+    };
+    let Ok(args) = params::tokenize_arguments(raw_args) else {
+        return prefill_on_error(HashMap::new());
+    };
+    let Ok(supplied) = params::map_positional_args(&order, &args) else {
+        return prefill_on_error(HashMap::new());
+    };
+    match params::validate_all(&snippet.parameters, &supplied) {
+        Ok(validated) => match params::render(&snippet.content, &validated.values) {
+            Ok(text) => Decision::Expand {
+                snippet_id: snippet.id.clone(),
+                delete_chars,
+                insert: text,
+            },
+            Err(_) => prefill_on_error(supplied),
+        },
+        Err(_) => prefill_on_error(supplied),
     }
 }
 
@@ -357,6 +498,7 @@ mod tests {
                         id: "s-name".into(),
                         content: "KimLeang".into(),
                         image: false,
+                        parameters: Vec::new(),
                     },
                 ),
                 (
@@ -365,6 +507,7 @@ mod tests {
                         id: "s-sig".into(),
                         content: "Best,\nKim".into(),
                         image: false,
+                        parameters: Vec::new(),
                     },
                 ),
             ],
@@ -408,6 +551,7 @@ mod tests {
                     id: "s-pad".into(),
                     content: "  Hello World \n".into(),
                     image: false,
+                    parameters: Vec::new(),
                 },
             )],
             true,
@@ -736,6 +880,7 @@ mod tests {
                     id: "s-logo".into(),
                     content: String::new(),
                     image: true,
+                    parameters: Vec::new(),
                 },
             )],
             true,
@@ -791,5 +936,208 @@ mod tests {
         assert!(validate_prefix("a").is_err());
         assert!(validate_prefix(";;").is_err());
         assert!(validate_prefix("").is_err());
+    }
+
+    fn killport_index() -> SnippetIndex {
+        SnippetIndex::new(
+            [(
+                "killport",
+                IndexedSnippet {
+                    id: "s-killport".into(),
+                    content: "lsof -tiTCP:{{port}} -sTCP:LISTEN | xargs kill".into(),
+                    image: false,
+                    parameters: vec![Parameter {
+                        name: "port".into(),
+                        kind: params::ParamType::Integer {
+                            min: Some(1),
+                            max: Some(65535),
+                        },
+                        required: true,
+                        default: None,
+                    }],
+                },
+            )],
+            true,
+        )
+    }
+
+    fn hello_index() -> SnippetIndex {
+        SnippetIndex::new(
+            [(
+                "hello",
+                IndexedSnippet {
+                    id: "s-hello".into(),
+                    content: "Hello {{name}}, your project {{project}} is ready.".into(),
+                    image: false,
+                    parameters: vec![
+                        Parameter {
+                            name: "name".into(),
+                            kind: params::ParamType::Text {
+                                min_length: None,
+                                max_length: None,
+                                pattern: None,
+                            },
+                            required: true,
+                            default: None,
+                        },
+                        Parameter {
+                            name: "project".into(),
+                            kind: params::ParamType::Text {
+                                min_length: None,
+                                max_length: None,
+                                pattern: None,
+                            },
+                            required: true,
+                            default: None,
+                        },
+                    ],
+                },
+            )],
+            true,
+        )
+    }
+
+    fn run_with(text: &str, key: TriggerKey, config: &EngineConfig, idx: &SnippetIndex) -> Decision {
+        let mut engine = Engine::new();
+        type_word(&mut engine, text, config, idx);
+        engine.feed(KeyInput::Trigger(key), config, idx)
+    }
+
+    fn tab_config() -> EngineConfig {
+        EngineConfig {
+            mode: TriggerMode::Tab,
+            ..EngineConfig::default()
+        }
+    }
+
+    #[test]
+    fn inline_parameterized_expansion_with_tab() {
+        let config = tab_config();
+        let decision = run_with(";killport 5173", TriggerKey::Tab, &config, &killport_index());
+        assert_eq!(
+            decision,
+            Decision::Expand {
+                snippet_id: "s-killport".into(),
+                delete_chars: ";killport 5173".chars().count(),
+                insert: "lsof -tiTCP:5173 -sTCP:LISTEN | xargs kill".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn parameterized_snippet_ignores_space_trigger() {
+        let config = EngineConfig {
+            mode: TriggerMode::Both,
+            ..EngineConfig::default()
+        };
+        // Space must never complete a parameterized snippet, even mid-args.
+        assert_eq!(
+            run_with(";killport", TriggerKey::Space, &config, &killport_index()),
+            Decision::Pass
+        );
+    }
+
+    #[test]
+    fn missing_required_parameter_opens_prompt_not_expand() {
+        let config = tab_config();
+        let decision = run_with(";killport", TriggerKey::Tab, &config, &killport_index());
+        assert_eq!(
+            decision,
+            Decision::Prompt {
+                snippet_id: "s-killport".into(),
+                delete_chars: ";killport".chars().count(),
+                prefill: HashMap::new(),
+                typed: ";killport".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_inline_argument_opens_prompt_with_typed_value_preserved() {
+        let config = tab_config();
+        let decision = run_with(";killport abc", TriggerKey::Tab, &config, &killport_index());
+        let mut expected_prefill = HashMap::new();
+        expected_prefill.insert("port".to_string(), "abc".to_string());
+        assert_eq!(
+            decision,
+            Decision::Prompt {
+                snippet_id: "s-killport".into(),
+                delete_chars: ";killport abc".chars().count(),
+                prefill: expected_prefill,
+                typed: ";killport abc".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn multi_parameter_quoted_inline_expansion() {
+        let config = tab_config();
+        let decision = run_with(
+            ";hello \"John Smith\" Clipet",
+            TriggerKey::Tab,
+            &config,
+            &hello_index(),
+        );
+        assert_eq!(
+            decision,
+            Decision::Expand {
+                snippet_id: "s-hello".into(),
+                delete_chars: ";hello \"John Smith\" Clipet".chars().count(),
+                insert: "Hello John Smith, your project Clipet is ready.".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn unrelated_text_after_a_static_snippet_does_not_expand_it() {
+        // Guards against the backward scan loosening plain static-snippet
+        // matching: `;name` is static (no parameters), so trailing text
+        // after it must behave exactly as before — no match at all.
+        let config = tab_config();
+        assert_eq!(
+            run_with(";name is here", TriggerKey::Tab, &config, &index(true)),
+            Decision::Pass
+        );
+    }
+
+    #[test]
+    fn positional_args_follow_parameter_order_not_template_order() {
+        // A per-OS variant may use the placeholders in a different order;
+        // `;cmd 1 2` must still mean a=1, b=2 everywhere.
+        let text = |name: &str| Parameter {
+            name: name.into(),
+            kind: params::ParamType::Text { min_length: None, max_length: None, pattern: None },
+            required: true,
+            default: None,
+        };
+        let idx = SnippetIndex::new(
+            [(
+                "cmd",
+                IndexedSnippet {
+                    id: "s-cmd".into(),
+                    content: "{{b}}-{{a}}".into(),
+                    image: false,
+                    parameters: vec![text("a"), text("b")],
+                },
+            )],
+            true,
+        );
+        assert_eq!(
+            run_with(";cmd 1 2", TriggerKey::Tab, &tab_config(), &idx),
+            Decision::Expand { snippet_id: "s-cmd".into(), delete_chars: 8, insert: "2-1".into() }
+        );
+    }
+
+    #[test]
+    fn expanding_with_args_resets_the_tracked_line() {
+        let config = tab_config();
+        let mut engine = Engine::new();
+        type_word(&mut engine, ";killport 5173", &config, &killport_index());
+        engine.feed(KeyInput::Trigger(TriggerKey::Tab), &config, &killport_index());
+        // A later plain Tab with nothing typed must not re-match anything.
+        assert_eq!(
+            engine.feed(KeyInput::Trigger(TriggerKey::Tab), &config, &killport_index()),
+            Decision::Pass
+        );
     }
 }

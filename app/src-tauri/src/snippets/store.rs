@@ -39,7 +39,7 @@ pub fn image_path(data_dir: &Path, snippet: &Snippet) -> Option<std::path::PathB
 
 /// Bumped whenever a migration step is added below. Stored in SQLite's own
 /// `PRAGMA user_version`, so each step runs exactly once per database.
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
 
 pub fn open(data_dir: &Path) -> Connection {
     std::fs::create_dir_all(data_dir).expect("failed to create app data dir");
@@ -92,7 +92,59 @@ fn migrate(conn: &Connection) {
         )
         .expect("failed to migrate database to schema version 2");
     }
-    debug_assert!(SCHEMA_VERSION == 2, "add the new migration step above");
+    if version < 3 {
+        // Parameter configuration for dynamic `{{name}}` snippets, stored as
+        // a JSON array of `params::Parameter`. `'[]'` means "no parameters",
+        // so every pre-existing (static) snippet keeps expanding exactly as
+        // before (spec Part I: backward-compatible reads, no data loss).
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE snippets ADD COLUMN parameters TEXT NOT NULL DEFAULT '[]';
+             PRAGMA user_version = 3;
+             COMMIT;",
+        )
+        .expect("failed to migrate database to schema version 3");
+    }
+    if version < 4 {
+        // Optional per-OS versions of the template, as a JSON object keyed by
+        // "macos" / "windows" / "linux". `'{}'` means one template for every
+        // OS (`content`), which is what every pre-v4 snippet reads back as.
+        conn.execute_batch(
+            "BEGIN;
+             ALTER TABLE snippets ADD COLUMN variants TEXT NOT NULL DEFAULT '{}';
+             PRAGMA user_version = 4;
+             COMMIT;",
+        )
+        .expect("failed to migrate database to schema version 4");
+    }
+    debug_assert!(SCHEMA_VERSION == 4, "add the new migration step above");
+}
+
+pub const PLATFORMS: [&str; 3] = ["macos", "windows", "linux"];
+
+/// The OS key this build runs on, matching the `variants` JSON keys.
+pub fn current_platform() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(windows) {
+        "windows"
+    } else {
+        "linux"
+    }
+}
+
+/// Parses the `variants` column; anything unreadable means "no variants".
+pub fn parse_variants(json: &str) -> std::collections::BTreeMap<String, String> {
+    serde_json::from_str(json).unwrap_or_default()
+}
+
+/// The template a snippet uses on `platform`: its non-empty variant for that
+/// OS if it has one, otherwise the default `content` (the documented fallback).
+pub fn resolve_template(content: &str, variants_json: &str, platform: &str) -> String {
+    parse_variants(variants_json)
+        .remove(platform)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| content.to_string())
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -111,9 +163,14 @@ pub struct Snippet {
     pub updated_at: i64,
     pub last_used_at: Option<i64>,
     pub suffix: String,
+    /// JSON array of `params::Parameter`; `"[]"` means a static snippet with
+    /// no `{{placeholder}}`s, which is how every pre-v3 row reads back.
+    pub parameters: String,
+    /// JSON object of per-OS templates (see `resolve_template`); `"{}"` for none.
+    pub variants: String,
 }
 
-const SNIPPET_COLUMNS: &str = "id, name, keyword, content, content_type, category, enabled, favorite, use_count, created_at, updated_at, last_used_at, suffix";
+const SNIPPET_COLUMNS: &str = "id, name, keyword, content, content_type, category, enabled, favorite, use_count, created_at, updated_at, last_used_at, suffix, parameters, variants";
 
 fn row_to_snippet(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snippet> {
     Ok(Snippet {
@@ -130,6 +187,8 @@ fn row_to_snippet(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snippet> {
         updated_at: row.get(10)?,
         last_used_at: row.get(11)?,
         suffix: row.get(12)?,
+        parameters: row.get(13)?,
+        variants: row.get(14)?,
     })
 }
 
@@ -172,8 +231,8 @@ pub fn keyword_owner(conn: &Connection, keyword: &str, except_id: Option<&str>) 
 
 pub fn insert_snippet(conn: &Connection, snippet: &Snippet) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO snippets (id, name, keyword, content, content_type, category, enabled, favorite, use_count, created_at, updated_at, last_used_at, suffix)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+        "INSERT INTO snippets (id, name, keyword, content, content_type, category, enabled, favorite, use_count, created_at, updated_at, last_used_at, suffix, parameters, variants)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             snippet.id,
             snippet.name,
@@ -188,6 +247,8 @@ pub fn insert_snippet(conn: &Connection, snippet: &Snippet) -> Result<(), String
             snippet.updated_at,
             snippet.last_used_at,
             snippet.suffix,
+            snippet.parameters,
+            snippet.variants,
         ],
     )
     .map(|_| ())
@@ -212,6 +273,28 @@ pub fn update_snippet(
             params![name, keyword, content, content_type, enabled as i64, updated_at, id, suffix],
         )
         .map_err(|e| format!("could not save the snippet: {e}"))?;
+    if changed == 0 {
+        return Err("that snippet no longer exists".to_string());
+    }
+    Ok(())
+}
+
+/// Replaces a snippet's parameter configuration (JSON array of
+/// `params::Parameter`) and per-OS variants (JSON object), independent of the
+/// other editable fields.
+pub fn update_snippet_template_config(
+    conn: &Connection,
+    id: &str,
+    parameters_json: &str,
+    variants_json: &str,
+    updated_at: i64,
+) -> Result<(), String> {
+    let changed = conn
+        .execute(
+            "UPDATE snippets SET parameters = ?1, variants = ?2, updated_at = ?3 WHERE id = ?4",
+            params![parameters_json, variants_json, updated_at, id],
+        )
+        .map_err(|e| format!("could not save the snippet's parameters: {e}"))?;
     if changed == 0 {
         return Err("that snippet no longer exists".to_string());
     }
@@ -358,6 +441,8 @@ mod tests {
             updated_at: 1,
             last_used_at: None,
             suffix: "exact".into(),
+            parameters: "[]".into(),
+            variants: "{}".into(),
         }
     }
 
@@ -480,6 +565,59 @@ mod tests {
         let conn = open(&dir.0);
         let old = get_snippet(&conn, "old").unwrap();
         assert_eq!((old.content.as_str(), old.suffix.as_str()), ("Hello World", "exact"));
+        assert_eq!(old.parameters, "[]");
+        assert_eq!(old.variants, "{}");
+        assert_eq!(resolve_template(&old.content, &old.variants, "windows"), "Hello World");
+    }
+
+    #[test]
+    fn version_3_databases_gain_empty_variants_and_keep_parameters() {
+        let dir = TempDir::new();
+        std::fs::create_dir_all(&dir.0).unwrap();
+        {
+            let conn = Connection::open(dir.0.join(SNIPPETS_DB_FILE)).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE snippets (id TEXT PRIMARY KEY, name TEXT NOT NULL, keyword TEXT NOT NULL,
+                   content TEXT NOT NULL, content_type TEXT NOT NULL DEFAULT 'text', category TEXT,
+                   enabled INTEGER NOT NULL DEFAULT 1, favorite INTEGER NOT NULL DEFAULT 0,
+                   use_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                   updated_at INTEGER NOT NULL, last_used_at INTEGER, app_rules TEXT NOT NULL DEFAULT '',
+                   suffix TEXT NOT NULL DEFAULT 'exact', parameters TEXT NOT NULL DEFAULT '[]');
+                 CREATE TABLE app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO snippets (id, name, keyword, content, created_at, updated_at, parameters)
+                   VALUES ('kp', 'Kill', 'killport', 'lsof {{port}}', 1, 1, '[{\"name\":\"port\",\"kind\":\"integer\",\"min\":null,\"max\":null,\"required\":true,\"default\":null}]');
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        }
+        let conn = open(&dir.0);
+        let kp = get_snippet(&conn, "kp").unwrap();
+        assert_eq!(kp.variants, "{}");
+        assert!(kp.parameters.contains("\"port\""));
+    }
+
+    #[test]
+    fn variants_resolve_per_platform_with_content_as_fallback() {
+        let variants = r#"{"windows":"win {{p}}","linux":""}"#;
+        assert_eq!(resolve_template("default {{p}}", variants, "windows"), "win {{p}}");
+        assert_eq!(resolve_template("default {{p}}", variants, "macos"), "default {{p}}");
+        // An empty variant counts as "no variant", not "insert nothing".
+        assert_eq!(resolve_template("default {{p}}", variants, "linux"), "default {{p}}");
+        assert_eq!(resolve_template("default", "not json", "macos"), "default");
+    }
+
+    #[test]
+    fn template_config_update_leaves_other_fields_untouched() {
+        let dir = TempDir::new();
+        let conn = open(&dir.0);
+        insert_snippet(&conn, &snippet("a", "killport")).unwrap();
+        update_snippet_template_config(&conn, "a", r#"[{"name":"port"}]"#, r#"{"windows":"w"}"#, 42).unwrap();
+        let got = get_snippet(&conn, "a").unwrap();
+        assert_eq!(got.parameters, r#"[{"name":"port"}]"#);
+        assert_eq!(got.variants, r#"{"windows":"w"}"#);
+        assert_eq!(got.updated_at, 42);
+        assert_eq!(got.content, "content of a");
+        assert!(update_snippet_template_config(&conn, "missing", "[]", "{}", 1).is_err());
     }
 
     #[test]

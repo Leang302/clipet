@@ -93,6 +93,7 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "objc2-vision",
+ "regex",
  "rusqlite",
  "serde",
  "serde_json",

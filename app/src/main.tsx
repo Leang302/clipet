@@ -3,9 +3,10 @@ import ReactDOM from "react-dom/client";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import App from "./App";
 import Editor from "./Editor";
+import PromptWindow from "./PromptWindow";
 
 const label = getCurrentWindow().label;
-const Root = label === "editor" ? Editor : App;
+const Root = label === "editor" ? Editor : label === "prompt" ? PromptWindow : App;
 
 // Both windows load the same bundle, so both stylesheets apply everywhere.
 // Page-level rules (e.g. body background) are scoped by this attribute so

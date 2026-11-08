@@ -26,6 +26,19 @@
         "shadow": true
       },
       {
+        "label": "prompt",
+        "title": "Fill in snippet — Clipet",
+        "width": 440,
+        "height": 340,
+        "visible": false,
+        "decorations": false,
+        "transparent": true,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": true
+      },
+      {
         "label": "editor",
         "title": "Annotate — Clipet",
         "width": 1000,

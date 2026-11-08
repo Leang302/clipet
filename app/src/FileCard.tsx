@@ -1,5 +1,10 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import {
+  ExternalLink, File, FileArchive, FileAudio, FileCode, FileImage, FileSpreadsheet, FileText, FileVideo, Files, Folder,
+  FolderOpen, Presentation,
+  type LucideIcon,
+} from "lucide-react";
 
 /** One file or folder a file entry points to, looked up live (see `file_entries`). */
 export type FileEntry = {
@@ -18,33 +23,38 @@ export type FileEntry = {
 const IS_MAC = navigator.userAgent.includes("Mac");
 export const REVEAL_LABEL = IS_MAC ? "Reveal in Finder" : "Show in Explorer";
 
-const ICONS: [string, string[]][] = [
-  ["📦", ["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "dmg", "iso"]],
-  ["📊", ["xlsx", "xls", "csv", "numbers", "ods"]],
-  ["📝", ["doc", "docx", "pages", "odt", "rtf", "txt", "md"]],
-  ["📕", ["pdf"]],
-  ["📽️", ["ppt", "pptx", "key", "odp"]],
-  ["🖼️", ["png", "jpg", "jpeg", "gif", "webp", "heic", "bmp", "tiff", "svg"]],
-  ["🎞️", ["mp4", "mov", "mkv", "avi", "webm", "m4v"]],
-  ["🎵", ["mp3", "wav", "aac", "flac", "m4a", "ogg"]],
-  ["💻", ["js", "ts", "tsx", "jsx", "py", "rs", "go", "java", "c", "cpp", "h", "cs", "rb", "php", "swift", "kt", "html", "css", "json", "yml", "yaml", "sh", "sql"]],
+const ICONS: [string, LucideIcon, string[]][] = [
+  ["archive", FileArchive, ["zip", "rar", "7z", "tar", "gz", "tgz", "bz2", "xz", "dmg", "iso"]],
+  ["spreadsheet", FileSpreadsheet, ["xlsx", "xls", "csv", "numbers", "ods"]],
+  ["document", FileText, ["doc", "docx", "pages", "odt", "rtf", "txt", "md", "pdf"]],
+  ["presentation", Presentation, ["ppt", "pptx", "key", "odp"]],
+  ["image", FileImage, ["png", "jpg", "jpeg", "gif", "webp", "heic", "bmp", "tiff", "svg"]],
+  ["video", FileVideo, ["mp4", "mov", "mkv", "avi", "webm", "m4v"]],
+  ["audio", FileAudio, ["mp3", "wav", "aac", "flac", "m4a", "ogg"]],
+  ["code", FileCode, ["js", "ts", "tsx", "jsx", "py", "rs", "go", "java", "c", "cpp", "h", "cs", "rb", "php", "swift", "kt", "html", "css", "json", "yml", "yaml", "sh", "sql"]],
 ];
 
-export function fileIcon(extension: string, isDir = false): string {
-  if (isDir) return "📁";
-  return ICONS.find(([, exts]) => exts.includes(extension.toLowerCase()))?.[0] ?? "📄";
+/** `data-icon` names the kind, so the icon is identifiable without its artwork. */
+const icon = (kind: string, Icon: LucideIcon, size: number) => (
+  <Icon size={size} strokeWidth={1.75} aria-hidden="true" data-icon={kind} />
+);
+
+export function fileIcon(extension: string, isDir = false, size = 16): ReactNode {
+  if (isDir) return icon("folder", Folder, size);
+  const match = ICONS.find(([, , exts]) => exts.includes(extension.toLowerCase()));
+  return match ? icon(match[0], match[1], size) : icon("file", File, size);
 }
 
 /** Icon for a file history row from its stored paths (no disk access). */
-export function fileItemIcon(content: string): string {
+export function fileItemIcon(content: string): ReactNode {
   try {
     const paths: string[] = JSON.parse(content);
-    if (paths.length > 1) return "🗂️";
+    if (paths.length > 1) return icon("files", Files, 16);
     const name = paths[0]?.split(/[\\/]/).pop() ?? "";
     const dot = name.lastIndexOf(".");
-    return dot > 0 ? fileIcon(name.slice(dot + 1)) : "📁";
+    return dot > 0 ? fileIcon(name.slice(dot + 1)) : icon("folder", Folder, 16);
   } catch {
-    return "📄";
+    return icon("file", File, 16);
   }
 }
 
@@ -99,7 +109,7 @@ export function FileCard(props: {
       <div className="file-list" role="list">
         {entries.map((f, index) => (
           <div className={"file-row" + (f.exists ? "" : " missing")} role="listitem" key={index}>
-            <span className="file-icon" aria-hidden>{fileIcon(f.extension, f.is_dir)}</span>
+            <span className="file-icon" aria-hidden>{fileIcon(f.extension, f.is_dir, 22)}</span>
             <div className="file-info">
               <div className="file-name selectable">{f.name}</div>
               <div className="file-path selectable" title={f.path}>{f.path}</div>
@@ -107,8 +117,8 @@ export function FileCard(props: {
             </div>
             {many && f.exists && (
               <div className="file-row-actions">
-                <button className="icon-btn" title={REVEAL_LABEL} aria-label={`${REVEAL_LABEL}: ${f.name}`} onClick={() => act("open_file_entry", { index, reveal: true })}>⌕</button>
-                <button className="icon-btn" title="Open" aria-label={`Open ${f.name}`} onClick={() => act("open_file_entry", { index, reveal: false })}>↗</button>
+                <button className="icon-btn" title={REVEAL_LABEL} aria-label={`${REVEAL_LABEL}: ${f.name}`} onClick={() => act("open_file_entry", { index, reveal: true })}><FolderOpen size={14} strokeWidth={1.75} aria-hidden="true" /></button>
+                <button className="icon-btn" title="Open" aria-label={`Open ${f.name}`} onClick={() => act("open_file_entry", { index, reveal: false })}><ExternalLink size={14} strokeWidth={1.75} aria-hidden="true" /></button>
               </div>
             )}
           </div>

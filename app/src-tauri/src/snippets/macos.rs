@@ -153,6 +153,10 @@ fn watch_secure_input(service: Arc<SnippetService>) {
     });
 }
 
+/// The running hook's state, so a confirmed popup (`complete_prompt`) inserts
+/// through the same held-key queue and main-thread path as typed expansions.
+static SHARED: std::sync::OnceLock<Arc<Shared>> = std::sync::OnceLock::new();
+
 pub fn start(service: Arc<SnippetService>, monitor: Arc<MonitorState>) {
     watch_secure_input(service.clone());
     let (jobs, job_rx) = mpsc::channel::<Job>();
@@ -165,6 +169,7 @@ pub fn start(service: Arc<SnippetService>, monitor: Arc<MonitorState>) {
         jobs,
         own_pid: i64::from(std::process::id()),
     });
+    let _ = SHARED.set(shared.clone());
 
     let worker_shared = shared.clone();
     std::thread::spawn(move || {
@@ -304,6 +309,7 @@ fn on_key_down(shared: &Shared, event: &CGEvent) -> CallbackResult {
                 Decision::Expand { .. } => "expand",
                 Decision::ExpandImage { .. } => "expand image",
                 Decision::Escape { .. } => "escape",
+                Decision::Prompt { .. } => "prompt",
             },
             if replay { ", replayed" } else { "" },
             if previous_pid != target_pid { ", target changed" } else { "" },
@@ -415,6 +421,15 @@ fn run_job(shared: &Shared, monitor: &Arc<MonitorState>, job: Job) {
         target_pid,
         verify_boundary,
     } = job;
+    let decision = match decision {
+        Decision::Prompt {
+            snippet_id,
+            delete_chars,
+            prefill,
+            typed,
+        } => return open_prompt(shared, snippet_id, delete_chars, typed, prefill, &trigger),
+        other => other,
+    };
     let (delete_chars, insert, snippet_id) = match decision {
         Decision::Expand {
             snippet_id,
@@ -445,6 +460,7 @@ fn run_job(shared: &Shared, monitor: &Arc<MonitorState>, job: Job) {
             insert,
         } => (delete_chars, Some(Insert::Text(insert)), None),
         Decision::Pass => (0, Some(Insert::Text(String::new())), None),
+        Decision::Prompt { .. } => unreachable!("handled above"),
     };
     let Some(insert) = insert else {
         shared.engine.lock().unwrap().reset();
@@ -470,6 +486,7 @@ fn run_job(shared: &Shared, monitor: &Arc<MonitorState>, job: Job) {
             verify_boundary,
             delete_chars,
             &insert,
+            None,
         ));
     });
     let outcome = if dispatched.is_ok() {
@@ -512,6 +529,129 @@ fn run_job(shared: &Shared, monitor: &Arc<MonitorState>, job: Job) {
     }
 }
 
+/// A parameterized snippet still needs values: remember exactly where it was
+/// typed and open the popup. The invocation stays in the field untouched until
+/// the user confirms (`complete_prompt`); the Tab that triggered it is consumed.
+fn open_prompt(
+    shared: &Shared,
+    snippet_id: String,
+    delete_chars: usize,
+    typed: String,
+    prefill: std::collections::HashMap<String, String>,
+    trigger: &SendEvent,
+) {
+    let give_back_tab = |reason: &str| {
+        super::diag(&format!("prompt: not opened: {reason}"));
+        shared.engine.lock().unwrap().reset();
+        replay(&trigger.0);
+        release_held(shared);
+    };
+    // Password fields: never take part (Part D4). (IME is checked again on
+    // the main thread at insert time; its APIs can't be called from here.)
+    if unsafe { IsSecureEventInputEnabled() } != 0 {
+        return give_back_tab("secure input is on");
+    }
+    let Some(pid) = frontmost_pid() else {
+        return give_back_tab("no frontmost app");
+    };
+    let target = crate::PasteTarget {
+        pid: Some(pid),
+        window: crate::paste_target::focused_window(pid),
+        element: crate::paste_target::focused_element(pid),
+    };
+    super::diag(&format!(
+        "prompt: opening for {delete_chars} typed chars in pid {pid} (field {})",
+        if target.element.is_some() { "known" } else { "not exposed" }
+    ));
+    shared.engine.lock().unwrap().reset();
+    // Keys typed right after Tab still belong to that app; deliver them before
+    // the popup takes focus. (Any text they add after the invocation makes the
+    // later check fail, so nothing gets replaced in the wrong place.)
+    release_held(shared);
+    if !shared.service.open_prompt(snippet_id, delete_chars, typed, prefill, target) {
+        super::diag("prompt: window unavailable; delivering Tab");
+        replay(&trigger.0);
+    }
+}
+
+/// Finishes a confirmed popup request: returns focus to the app the shortcut
+/// was typed in and, only if it is verifiably the same place, replaces the
+/// invocation with `text`. Every uncertainty cancels instead of guessing.
+pub(super) fn complete_prompt(
+    app: &tauri::AppHandle,
+    monitor: &Arc<MonitorState>,
+    pending: super::prompt::PendingPrompt,
+    text: &str,
+) -> Result<(), String> {
+    let shared = SHARED
+        .get()
+        .ok_or_else(|| "the keyboard listener isn't running; nothing was inserted".to_string())?;
+    let pid = pending
+        .target
+        .pid
+        .ok_or_else(|| "the original app is unknown; nothing was inserted".to_string())?;
+    crate::return_focus_to_previous_app(app, &pending.target)
+        .map_err(|_| "Couldn't return to the app you were typing in, so nothing was inserted.".to_string())?;
+    // That handoff falls back to any other app if the original quit; an
+    // insertion must not.
+    if crate::frontmost_application_pid() != Some(pid) {
+        return Err("The app you were typing in is no longer in front, so nothing was inserted.".to_string());
+    }
+    if let Some(field) = &pending.target.element {
+        if !crate::paste_target::focused_element(pid).is_some_and(|current| current == *field) {
+            return Err("The text field you were typing in no longer has focus, so nothing was inserted.".to_string());
+        }
+    }
+
+    *shared.held.lock().unwrap() = Some(Vec::new());
+    let insert = Insert::Text(text.to_string());
+    let delete_chars = pending.delete_chars;
+    let typed = pending.typed;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let (sent, received) = mpsc::sync_channel(1);
+    let main_cancelled = cancelled.clone();
+    let main_monitor = monitor.clone();
+    let dispatched = app.run_on_main_thread(move || {
+        if main_cancelled.load(Ordering::SeqCst) {
+            return;
+        }
+        let _ = sent.send(replace_on_main(
+            &main_monitor,
+            i64::from(pid),
+            false,
+            delete_chars,
+            &insert,
+            Some(&typed),
+        ));
+    });
+    let outcome = if dispatched.is_ok() {
+        received.recv_timeout(MAIN_THREAD_TIMEOUT).ok()
+    } else {
+        None
+    };
+    cancelled.store(true, Ordering::SeqCst);
+    // Whatever happened, the engine no longer knows the text at the caret.
+    shared.engine.lock().unwrap().reset();
+    match outcome {
+        Some(Outcome::Done { restore }) => {
+            release_held(shared);
+            if let Some(restore) = restore {
+                std::thread::sleep(CLIPBOARD_RESTORE_DELAY);
+                restore.apply();
+            }
+            Ok(())
+        }
+        Some(Outcome::Skipped(reason)) => {
+            release_held(shared);
+            Err(format!("Nothing was inserted: {reason}."))
+        }
+        None => {
+            release_held(shared);
+            Err("Nothing was inserted: the app didn't respond in time.".to_string())
+        }
+    }
+}
+
 /// Replays held key presses in order. New presses that arrive while replaying
 /// keep queueing behind them; the queue closes only once it is empty.
 fn release_held(shared: &Shared) {
@@ -543,6 +683,7 @@ fn replace_on_main(
     verify_boundary: bool,
     delete_chars: usize,
     insert: &Insert,
+    expected_before_caret: Option<&str>,
 ) -> Outcome {
     // Password fields turn on secure input; IMEs (Korean, Japanese, Chinese…)
     // compose text the tap can't see. Never rewrite text in either case.
@@ -564,6 +705,14 @@ fn replace_on_main(
             // The field doesn't expose its text (some Electron apps): assume
             // the shortcut starts a word rather than refuse to expand.
             None => super::diag("note: field text unavailable, assuming word start"),
+        }
+    }
+    if let Some(expected) = expected_before_caret {
+        match text_before_caret_is(expected) {
+            Some(false) => return Outcome::Skipped("the text before the cursor changed"),
+            Some(true) => {}
+            // Same policy as above; the app and field were already confirmed.
+            None => super::diag("note: field text unavailable, relying on app and field match"),
         }
     }
 
@@ -712,6 +861,65 @@ fn text_before_word_is_boundary(word_chars: usize) -> Option<bool> {
         }
         let text = CFString::wrap_under_create_rule(text as CFStringRef).to_string();
         Some(text.chars().all(char::is_whitespace))
+    }
+}
+
+/// Whether the focused field's text immediately before the caret is exactly
+/// `expected`. `expected` is ASCII (the engine only builds such invocations),
+/// so its length in UTF-16 units — what Accessibility ranges count — equals
+/// its char count. `None` when the field doesn't expose its text or caret.
+/// Reads only that many characters.
+fn text_before_caret_is(expected: &str) -> Option<bool> {
+    use core_foundation::string::{CFString, CFStringRef};
+
+    if !expected.is_ascii() || expected.is_empty() {
+        return None;
+    }
+    let len = expected.len() as isize;
+    unsafe fn copy_attribute(element: *const c_void, name: &str) -> Option<Owned> {
+        let name = CFString::new(name);
+        let mut value = std::ptr::null();
+        let status = unsafe {
+            AXUIElementCopyAttributeValue(element, name.as_concrete_TypeRef() as _, &mut value)
+        };
+        (status == 0 && !value.is_null()).then(|| Owned(value))
+    }
+
+    unsafe {
+        let system = Owned(AXUIElementCreateSystemWide());
+        AXUIElementSetMessagingTimeout(system.0, 0.25);
+        let focused = copy_attribute(system.0, "AXFocusedUIElement")?;
+        let selection = copy_attribute(focused.0, "AXSelectedTextRange")?;
+        let mut caret = CFRange {
+            location: 0,
+            length: 0,
+        };
+        if !AXValueGetValue(selection.0, AX_VALUE_CF_RANGE, &mut caret as *mut _ as *mut c_void)
+            || caret.length != 0
+        {
+            return None;
+        }
+        if caret.location < len {
+            return Some(false);
+        }
+        let range = CFRange {
+            location: caret.location - len,
+            length: len,
+        };
+        let parameter = Owned(AXValueCreate(AX_VALUE_CF_RANGE, &range as *const _ as *const c_void));
+        let attribute = CFString::new("AXStringForRange");
+        let mut text = std::ptr::null();
+        let status = AXUIElementCopyParameterizedAttributeValue(
+            focused.0,
+            attribute.as_concrete_TypeRef() as _,
+            parameter.0,
+            &mut text,
+        );
+        if status != 0 || text.is_null() {
+            return None;
+        }
+        let text = CFString::wrap_under_create_rule(text as CFStringRef).to_string();
+        Some(text == expected)
     }
 }
 

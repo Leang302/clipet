@@ -10,7 +10,10 @@
 pub mod engine;
 #[cfg(target_os = "macos")]
 mod macos;
+pub mod params;
+pub mod prompt;
 pub mod store;
+pub mod transfer;
 #[cfg(windows)]
 mod windows;
 
@@ -64,6 +67,8 @@ pub struct SnippetStatus {
     /// secure input on. While it's on no app can see typing, so nothing can
     /// expand anywhere. `None` when typing is visible.
     pub blocked_by: Option<String>,
+    /// "macos" / "windows" / "linux": which per-OS template variant applies.
+    pub platform: &'static str,
 }
 
 /// What the keyboard hook reads on every key press, swapped atomically as a
@@ -92,6 +97,9 @@ pub struct SnippetService {
     listener: AtomicU8,
     blocked_by: Mutex<Option<String>>,
     on_status: OnceLock<Box<dyn Fn(&SnippetStatus) + Send + Sync>>,
+    /// The one missing-parameter popup that may be open (see `prompt.rs`).
+    prompt: Mutex<Option<prompt::PendingPrompt>>,
+    prompt_seq: AtomicU64,
 }
 
 static DIAG: OnceLock<Mutex<std::sync::mpsc::Sender<String>>> = OnceLock::new();
@@ -152,8 +160,13 @@ fn build_live(conn: &rusqlite::Connection) -> Live {
                 s.keyword.as_str(),
                 IndexedSnippet {
                     id: s.id.clone(),
-                    content: format!("{}{}", s.content, store::suffix_text(&s.suffix)),
+                    content: format!(
+                        "{}{}",
+                        store::resolve_template(&s.content, &s.variants, store::current_platform()),
+                        store::suffix_text(&s.suffix)
+                    ),
                     image: s.content_type == store::IMAGE,
+                    parameters: params::parse_parameters(&s.parameters),
                 },
             )
         }),
@@ -191,6 +204,8 @@ impl SnippetService {
             listener: AtomicU8::new(0),
             blocked_by: Mutex::new(None),
             on_status: OnceLock::new(),
+            prompt: Mutex::new(None),
+            prompt_seq: AtomicU64::new(0),
         })
     }
 
@@ -287,6 +302,7 @@ impl SnippetService {
             paused_until: (paused && raw > 0).then_some(raw),
             listener: ListenerState::from_u8(self.listener.load(Ordering::SeqCst)),
             blocked_by: self.blocked_by.lock().unwrap().clone(),
+            platform: store::current_platform(),
         }
     }
 
@@ -447,12 +463,86 @@ pub struct SnippetInput {
     #[serde(default)]
     pub suffix: Option<String>,
     pub enabled: bool,
+    /// One entry per `{{placeholder}}` the content declares. Omitted or
+    /// empty means a static snippet. Must exactly match the set of
+    /// placeholders found in `content` (see `snippet_save`) — the editor is
+    /// expected to keep the two in sync via auto-detection.
+    #[serde(default)]
+    pub parameters: Vec<params::Parameter>,
+    /// Optional per-OS templates keyed by "macos" / "windows" / "linux";
+    /// `content` is used on any OS without one. Empty strings are dropped.
+    #[serde(default)]
+    pub variants: std::collections::BTreeMap<String, String>,
 }
 
 impl SnippetInput {
     fn is_image(&self) -> bool {
         self.content_type.as_deref() == Some(store::IMAGE)
     }
+}
+
+/// Checks that `parameters` names exactly match the `{{placeholder}}`s found
+/// in `content` — no placeholder left unconfigured, no leftover parameter
+/// config for a placeholder the user removed from the template (Part C4's
+/// "handle its configuration predictably without silently losing important
+/// data": here, predictably means "say so," not "guess"). Image snippets
+/// have no template, so they must have no parameters at all.
+fn validate_parameters(content: &str, parameters: &[params::Parameter]) -> Result<String, String> {
+    let mut seen = std::collections::HashSet::new();
+    for p in parameters {
+        if !seen.insert(p.name.as_str()) {
+            return Err(format!("parameter \"{}\" is configured more than once", p.name));
+        }
+    }
+    let declared: std::collections::HashSet<&str> = parameters.iter().map(|p| p.name.as_str()).collect();
+    let found = params::placeholders_in_order(content)
+        .map_err(|e| format!("the template has a problem: {e}"))?;
+    let found_set: std::collections::HashSet<&str> = found.iter().map(|s| s.as_str()).collect();
+    let unconfigured: Vec<&str> = found.iter().map(|s| s.as_str()).filter(|n| !declared.contains(n)).collect();
+    if !unconfigured.is_empty() {
+        return Err(format!(
+            "configure a type for {{{{{}}}}} before saving",
+            unconfigured.join("}}, {{")
+        ));
+    }
+    let orphaned: Vec<&str> = parameters
+        .iter()
+        .map(|p| p.name.as_str())
+        .filter(|n| !found_set.contains(n))
+        .collect();
+    if !orphaned.is_empty() {
+        return Err(format!(
+            "remove the configuration for {} — it no longer appears in the template",
+            orphaned.join(", ")
+        ));
+    }
+    Ok(params::parameters_to_json(parameters))
+}
+
+/// Checks each per-OS variant uses exactly the same parameters as the default
+/// template, so one invocation (`;killport 5173`) means the same thing on
+/// every OS (Part E). Returns the variants as stored JSON, empty ones dropped.
+fn validate_variants(
+    variants: &std::collections::BTreeMap<String, String>,
+    parameters: &[params::Parameter],
+) -> Result<String, String> {
+    let mut kept = std::collections::BTreeMap::new();
+    for (platform, template) in variants {
+        if !store::PLATFORMS.contains(&platform.as_str()) {
+            return Err(format!("unknown platform \"{platform}\""));
+        }
+        if template.is_empty() {
+            continue;
+        }
+        let label = match platform.as_str() {
+            "macos" => "macOS",
+            "windows" => "Windows",
+            _ => "Linux",
+        };
+        validate_parameters(template, parameters).map_err(|e| format!("{label} version: {e}"))?;
+        kept.insert(platform.clone(), template.clone());
+    }
+    serde_json::to_string(&kept).map_err(|e| e.to_string())
 }
 
 /// Accepts the keyword with or without the prefix the user sees (`;name` or
@@ -528,12 +618,28 @@ pub fn snippet_save(service: Service, input: SnippetInput) -> Result<Snippet, St
         Some(s) if store::valid_suffix(s) => s,
         Some(s) => return Err(format!("unknown insertion setting: {s}")),
     };
+    // Images have no template, so they never carry parameters regardless of
+    // what the editor sent.
+    let (parameters_json, variants_json) = if content_type == store::IMAGE {
+        ("[]".to_string(), "{}".to_string())
+    } else {
+        (
+            validate_parameters(&content, &input.parameters)?,
+            validate_variants(&input.variants, &input.parameters)?,
+        )
+    };
     let now = now_ms();
     let saved = match &existing {
-        Some(old) => store::update_snippet(
-            &conn, &old.id, &name, &keyword, &content, content_type, suffix, input.enabled, now,
-        )
-        .map(|_| old.id.clone()),
+        Some(old) => (|| {
+            // One transaction: a failure can't leave a half-updated snippet.
+            let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+            store::update_snippet(
+                &tx, &old.id, &name, &keyword, &content, content_type, suffix, input.enabled, now,
+            )?;
+            store::update_snippet_template_config(&tx, &old.id, &parameters_json, &variants_json, now)?;
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok::<_, String>(old.id.clone())
+        })(),
         None => {
             let id = new_id();
             store::insert_snippet(
@@ -552,6 +658,8 @@ pub fn snippet_save(service: Service, input: SnippetInput) -> Result<Snippet, St
                     updated_at: now,
                     last_used_at: None,
                     suffix: suffix.to_string(),
+                    parameters: parameters_json.clone(),
+                    variants: variants_json.clone(),
                 },
             )
             .map(|_| id)
@@ -634,6 +742,46 @@ pub fn snippet_duplicate(service: Service, id: String) -> Result<Snippet, String
     Ok(copy)
 }
 
+/// The text a Paste/Copy of a snippet from Clipet's own window inserts. A
+/// static snippet is returned as-is; a parameterized one must come with
+/// valid values — it is never pasted as its raw `{{name}}` template.
+pub fn render_for_paste(
+    template: &str,
+    parameters_json: &str,
+    values: Option<&std::collections::HashMap<String, String>>,
+) -> Result<String, String> {
+    let parameters = params::parse_parameters(parameters_json);
+    if parameters.is_empty() {
+        return Ok(template.to_string());
+    }
+    let empty = std::collections::HashMap::new();
+    let preview = params::preview(template, &parameters, values.unwrap_or(&empty))
+        .map_err(|e| e.to_string())?;
+    preview.text.ok_or_else(|| {
+        let mut names: Vec<&String> = preview.errors.keys().collect();
+        names.sort();
+        format!(
+            "Fill in {} first",
+            names.iter().map(|n| n.as_str()).collect::<Vec<_>>().join(", ")
+        )
+    })
+}
+
+/// Validates `values` for an (unsaved or saved) template and renders it when
+/// every field is valid. Takes the template directly rather than a snippet id
+/// so the editor can preview a draft before it is saved. Nothing here runs the
+/// result — it is only text (Part H).
+#[tauri::command]
+pub fn snippet_preview(
+    content: String,
+    parameters: Vec<params::Parameter>,
+    values: std::collections::HashMap<String, String>,
+    suffix: Option<String>,
+) -> Result<params::Preview, String> {
+    let template = format!("{content}{}", store::suffix_text(suffix.as_deref().unwrap_or("exact")));
+    params::preview(&template, &parameters, &values).map_err(|e| e.to_string())
+}
+
 /// A small PNG preview of an image snippet, as a data URL.
 #[tauri::command]
 pub fn snippet_image_preview(service: Service, id: String) -> Result<String, String> {
@@ -699,4 +847,90 @@ pub fn snippets_resume(service: Service) {
 
 pub fn service(app: &AppHandle) -> Arc<SnippetService> {
     app.state::<Arc<SnippetService>>().inner().clone()
+}
+
+#[cfg(test)]
+mod validate_parameters_tests {
+    use super::*;
+    use params::ParamType;
+
+    fn text_param(name: &str) -> params::Parameter {
+        params::Parameter {
+            name: name.to_string(),
+            kind: ParamType::Text {
+                min_length: None,
+                max_length: None,
+                pattern: None,
+            },
+            required: true,
+            default: None,
+        }
+    }
+
+    #[test]
+    fn static_content_requires_no_parameters() {
+        assert_eq!(validate_parameters("plain text", &[]).unwrap(), "[]");
+    }
+
+    #[test]
+    fn matching_parameters_are_accepted_and_serialized() {
+        let params_vec = vec![text_param("name")];
+        let json = validate_parameters("Hello {{name}}", &params_vec).unwrap();
+        assert_eq!(json, params::parameters_to_json(&params_vec));
+    }
+
+    #[test]
+    fn unconfigured_placeholder_is_rejected() {
+        let err = validate_parameters("Hello {{name}}", &[]).unwrap_err();
+        assert!(err.contains("name"), "error should mention the placeholder: {err}");
+    }
+
+    #[test]
+    fn orphaned_parameter_config_is_rejected() {
+        let err = validate_parameters("no placeholders here", &[text_param("name")]).unwrap_err();
+        assert!(err.contains("name"), "error should mention the orphaned parameter: {err}");
+    }
+
+    #[test]
+    fn duplicate_parameter_names_are_rejected() {
+        let err = validate_parameters("{{name}}", &[text_param("name"), text_param("name")]).unwrap_err();
+        assert!(err.contains("more than once"));
+    }
+
+    #[test]
+    fn malformed_template_is_rejected_before_parameter_matching() {
+        assert!(validate_parameters("Hello {{name", &[]).is_err());
+    }
+
+    #[test]
+    fn variants_must_use_the_same_parameters() {
+        let ps = vec![text_param("port")];
+        let mut v = std::collections::BTreeMap::new();
+        v.insert("windows".to_string(), "Stop {{port}}".to_string());
+        v.insert("linux".to_string(), String::new());
+        assert_eq!(validate_variants(&v, &ps).unwrap(), r#"{"windows":"Stop {{port}}"}"#);
+
+        v.insert("macos".to_string(), "lsof {{pid}}".to_string());
+        let err = validate_variants(&v, &ps).unwrap_err();
+        assert!(err.starts_with("macOS version:"), "{err}");
+
+        let mut bad = std::collections::BTreeMap::new();
+        bad.insert("beos".to_string(), "x".to_string());
+        assert!(validate_variants(&bad, &[]).is_err());
+    }
+
+    #[test]
+    fn static_snippets_paste_unchanged() {
+        assert_eq!(render_for_paste("Hi {{x}} literal", "[]", None).unwrap(), "Hi {{x}} literal");
+    }
+
+    #[test]
+    fn parameterized_snippet_never_pastes_its_raw_template() {
+        let json = params::parameters_to_json(&[text_param("name")]);
+        let err = render_for_paste("Hello {{name}}", &json, None).unwrap_err();
+        assert!(err.contains("name"), "{err}");
+        let mut values = std::collections::HashMap::new();
+        values.insert("name".to_string(), "Kim".to_string());
+        assert_eq!(render_for_paste("Hello {{name}}", &json, Some(&values)).unwrap(), "Hello Kim");
+    }
 }

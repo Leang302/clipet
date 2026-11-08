@@ -52,11 +52,18 @@ function mockTauri(label) {
     { ...base, id: "f2", kind: "file", content: JSON.stringify(["/Users/me/a.pdf", "/Volumes/USB/gone.xlsx"]), preview: "a.pdf, gone.xlsx", created_at: Date.now() - 9000 },
     { ...base, id: "t5", kind: "text", content: Array.from({ length: 400 }, (_, i) => `line ${i} ${i % 50 === 0 ? "needle" : "hay"}`).join("\n"), preview: "line 0 needle", created_at: Date.now() - 10000 },
   ];
-  const snip = { category: null, enabled: true, favorite: false, use_count: 0, created_at: 1, updated_at: 1, last_used_at: null };
+  const snip = { category: null, enabled: true, favorite: false, use_count: 0, created_at: 1, updated_at: 1, last_used_at: null, suffix: "exact", parameters: "[]" };
   let snippets = [
     { ...snip, id: "s1", name: "Name", keyword: "name", content: "KimLeang", content_type: "text" },
     { ...snip, id: "s2", name: "Logo", keyword: "logo", content: "snip-abc.png", content_type: "image" },
   ];
+  if (window.__paramSnippets) {
+    snippets.push({
+      ...snip, id: "s3", name: "Kill Port", keyword: "killport", content: "lsof -tiTCP:{{port}} -sTCP:LISTEN | xargs kill", content_type: "text",
+      parameters: JSON.stringify([{ name: "port", kind: "integer", min: 1, max: 65535, required: true, default: null }]),
+      variants: JSON.stringify({ windows: "Stop-Port {{port}}" }),
+    });
+  }
   // Fires an app event at the page's listeners, like the backend would.
   window.__emit = (event, payload = null) => calls
     .filter((c) => c.cmd === "plugin:event|listen" && c.args.event === event)
@@ -89,12 +96,43 @@ function mockTauri(label) {
         case "snippet_image_preview": return img(200, 120, "logo");
         case "snippet_save": {
           const input = args.input;
-          const saved = { ...snip, ...input, id: input.id || "s" + (snippets.length + 1), content: input.content_type === "image" ? "snip-new.png" : input.content, updated_at: Date.now() };
+          const saved = { ...snip, ...input, id: input.id || "s" + (snippets.length + 1), content: input.content_type === "image" ? "snip-new.png" : input.content, parameters: JSON.stringify(input.parameters ?? []), variants: JSON.stringify(input.variants ?? {}), updated_at: Date.now() };
           snippets = [...snippets.filter((x) => x.id !== saved.id), saved];
           return saved;
         }
+        // Minimal stand-in for the Rust validator (whose rules have their own
+        // unit tests): enough to drive the UI's error and result states.
+        case "snippet_preview": {
+          const errors = {}, vals = {};
+          for (const p of args.parameters) {
+            const raw = args.values[p.name] || p.default || "";
+            if (!raw) { if (p.required) errors[p.name] = "Required"; else vals[p.name] = ""; continue; }
+            if (p.kind === "integer" && !/^\s*-?\d+\s*$/.test(raw)) { errors[p.name] = `'${raw}' is not a whole number`; continue; }
+            vals[p.name] = raw.trim();
+          }
+          if (Object.keys(errors).length) return { text: null, errors };
+          const suffix = { space: " ", newline: "\n" }[args.suffix] ?? "";
+          return { text: (args.content + suffix).replace(/\{\{\s*(\w+)\s*\}\}/g, (_, n) => vals[n]), errors };
+        }
+        case "snippets_export": return { path: "/Users/me/Downloads/clipet-snippets-2026-11-08.json", count: snippets.filter((s) => s.content_type !== "image").length, skipped_images: 1 };
+        case "snippets_import": {
+          const file = JSON.parse(args.json);
+          const skipped = [], fresh = [];
+          for (const r of file.snippets) {
+            if (snippets.some((s) => s.keyword === r.keyword)) skipped.push({ keyword: r.keyword, reason: `;${r.keyword} is already in use` });
+            else fresh.push({ ...snip, id: "imp-" + r.keyword, name: r.name || r.keyword, keyword: r.keyword, content: r.content, content_type: "text" });
+          }
+          snippets = [...snippets, ...fresh];
+          return { imported: fresh.length, skipped };
+        }
+        case "snippet_prompt_get": return window.__prompt ?? null;
+        case "snippet_prompt_submit":
+          window.__prompt = null;
+          if (window.__promptSubmitFails) throw "Couldn't return to the app you were typing in, so nothing was inserted.";
+          return null;
+        case "snippet_prompt_cancel": window.__prompt = null; return null;
         case "snippet_settings_get": return { enabled: true, prefix: ";", trigger_mode: "space", escape_enabled: true, case_sensitive: true, default_pause_minutes: 15 };
-        case "snippets_status": return { enabled: true, paused: false, paused_until: null, listener: "active", blocked_by: window.__blockedBy ?? null };
+        case "snippets_status": return { enabled: true, paused: false, paused_until: null, listener: "active", blocked_by: window.__blockedBy ?? null, platform: window.__platform ?? "macos" };
         default: return null; // plugin:event|listen etc.
       }
     },
@@ -124,7 +162,7 @@ function mockTauri(label) {
     check("list uses thumbnails; full images only for previewed items", thumbLoads === 3 && !fullLoads.includes("img2.png"), `thumbs=${thumbLoads} full=${JSON.stringify(fullLoads)}`);
 
     // Drag across the sidebar and the history list.
-    const a = await page.locator(".sidebar-item").first().boundingBox();
+    const a = await page.locator(".nav-icon").first().boundingBox();
     const b = await page.locator(".clip-item").nth(3).boundingBox();
     await page.mouse.move(a.x + 5, a.y + 5);
     await page.mouse.down();
@@ -220,7 +258,7 @@ function mockTauri(label) {
     check("confirmed delete removes both items", deletes === 2, `delete calls=${deletes}`);
 
     // Clear dialog mentions pinned items and snippets.
-    await page.click("text=🗑 Clear");
+    await page.click('button[aria-label="Clear History"]');
     check("Clear keeps favorites, pinned items and snippets", (await page.$$("text=/Favorites and pinned items .* your snippets are kept/")).length === 1);
     await page.keyboard.press("Escape");
 
@@ -236,7 +274,7 @@ function mockTauri(label) {
     await page.waitForTimeout(50);
     const dragCases = [
       ["#sidebar", true], ["#search-row", true], ["#preview-header", true], ["#toolbar .hint-key", true],
-      [".sidebar-item", false], ["#search-input", false], [".clip-item", false], ["#sidebar select", false], ["#sidebar label", false],
+      [".nav-icon", false], ["#search-input", false], [".clip-item", false],
     ];
     for (const [selector, expected] of dragCases) {
       const got = await startsDrag(selector);
@@ -366,7 +404,7 @@ function mockTauri(label) {
     // A file entry: shown by name in Files, with explicit file actions.
     const fileRow = page.locator(".clip-item", { hasText: "Final Python.zip" });
     check("a file entry is listed by its name, not its stored paths", (await fileRow.count()) === 1 && !(await fileRow.textContent()).includes("["));
-    check("file entries get a file-type icon", (await fileRow.locator(".clip-thumb").textContent()).includes("📦"));
+    check("file entries get a file-type icon", (await fileRow.locator(".clip-thumb [data-icon=\"archive\"]").count()) === 1);
     await fileRow.click();
     await page.waitForSelector(".file-card .file-row");
     for (const label of ["Paste File", "Copy Path", "Copy File Link", "Open"]) {
@@ -393,7 +431,7 @@ function mockTauri(label) {
     await page.locator(".clip-item", { hasText: "line 0 needle" }).click();
     check("long text gets a compact preview", (await page.locator(".preview-text.clamped").count()) === 1);
     check("long text shows its size", (await page.locator(".expand-row").textContent()).includes("400 lines"));
-    await page.click("text=⤢ Expand");
+    await page.click('button:has-text("Expand")');
     await page.waitForSelector(".text-viewer");
     check("the viewer gives the text the sidebar's width", await page.locator("#sidebar").isHidden());
     check("the history list stays visible while reading", await page.locator("#item-list").isVisible());
@@ -427,7 +465,7 @@ function mockTauri(label) {
     check("Edit opens the annotation editor for that image", JSON.stringify(await callsOf("start_annotation")) === JSON.stringify([{ ids: ["img1"] }]));
 
     // History settings: off by default, preview before deleting.
-    await page.click("text=⚙ History Settings…");
+    await page.click('button[aria-label="Settings"]');
     await page.waitForSelector(".history-settings");
     check("retention is off by default", (await page.locator('.history-settings select[aria-label="Keep history"]').inputValue()) === "0");
     await page.selectOption('.history-settings select[aria-label="Keep history"]', "7");
@@ -520,6 +558,260 @@ function mockTauri(label) {
     // Searching snippet content never matches an image's file name.
     await page.fill("#search-input", "snip-abc");
     check("search ignores image file names", (await page.$$(".snippet-item")).length === 0);
+    await page.close();
+  }
+
+  // ---------------- Parameterized snippets ----------------
+  {
+    const page = await browser.newPage({ viewport: { width: 900, height: 660 } });
+    page.on("pageerror", (e) => errors.push("params: " + e.message));
+    await page.addInitScript(() => { window.__paramSnippets = true; });
+    await page.addInitScript(mockTauri, "history");
+    await page.goto(url);
+    await page.waitForSelector(".clip-item");
+    const callsOf = (cmd) => page.evaluate((cmd) => window.__calls.filter((c) => c.cmd === cmd).map((c) => c.args), cmd);
+    const rows = () => page.$$eval(".snippet-item .snippet-trigger", (els) => els.map((e) => e.textContent));
+
+    await page.click('button[aria-label="Snippets"]');
+    await page.waitForSelector(".snippet-item");
+    check("parameterized snippets carry a list badge", (await page.locator(".snippet-item", { hasText: ";killport" }).locator(".snippet-param-badge").count()) === 1
+      && (await page.locator(".snippet-item", { hasText: ";name" }).locator(".snippet-param-badge").count()) === 0);
+    await page.click(".snippet-kind-filter >> text=With parameters");
+    check("filter: with parameters", JSON.stringify(await rows()) === JSON.stringify([";killport"]), JSON.stringify(await rows()));
+    await page.click(".snippet-kind-filter >> text=Plain");
+    check("filter: plain", !(await rows()).includes(";killport") && (await rows()).includes(";name"), JSON.stringify(await rows()));
+    await page.click(".snippet-kind-filter >> text=All");
+
+    // Enter on a parameterized snippet asks for values instead of pasting its template.
+    await page.locator(".snippet-item", { hasText: ";killport" }).click();
+    await page.keyboard.press("Enter");
+    await page.waitForSelector(".snippet-test");
+    check("Enter opens the fill-in panel, pastes nothing", (await callsOf("paste_snippet")).length === 0);
+    check("the first field is focused", await page.evaluate(() => document.activeElement?.dataset.param === "port"));
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(250);
+    check("submitting empty shows Required, pastes nothing", (await page.locator(".param-error").textContent()) === "Required" && (await callsOf("paste_snippet")).length === 0);
+    await page.keyboard.type("abc");
+    await page.waitForTimeout(250);
+    check("an invalid value is explained", (await page.locator(".param-error").textContent()).includes("not a whole number"));
+    check("typing in the panel doesn't jump to search", await page.evaluate(() => document.activeElement?.dataset.param === "port"));
+    await page.fill('[data-param="port"]', "5173");
+    await page.waitForTimeout(250);
+    check("the exact result is previewed", (await page.locator(".snippet-test-output pre").textContent()) === "lsof -tiTCP:5173 -sTCP:LISTEN | xargs kill");
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(100);
+    check("Enter pastes with the typed values", JSON.stringify(await callsOf("paste_snippet")) === JSON.stringify([{ id: "s3", values: { port: "5173" } }]), JSON.stringify(await callsOf("paste_snippet")));
+    await page.keyboard.press("Escape");
+    check("Esc closes the panel, not the popup", (await page.locator(".snippet-test").count()) === 0 && !(await callsOf("hide_history")).length);
+
+    // Plain snippets still paste directly.
+    await page.locator(".snippet-item", { hasText: ";name" }).click();
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(100);
+    check("plain snippets still paste on Enter", (await callsOf("paste_snippet")).some((a) => a.id === "s1" && a.values === null));
+
+    // Editor: placeholders become parameters, with a live preview.
+    await page.click("text=+ New");
+    await page.fill(".snippet-keyword-field input", "greet");
+    await page.fill(".snippet-form textarea", "Hello {{name}}, welcome to {{project}}. Bye {{name}}!");
+    await page.waitForTimeout(150);
+    const detected = await page.$$eval(".snippet-param-name", (els) => els.map((e) => e.textContent));
+    check("placeholders are detected once each, in order", JSON.stringify(detected) === JSON.stringify(["{{name}}", "{{project}}"]), JSON.stringify(detected));
+    await page.fill('.snippet-test [data-param="name"]', "Kim");
+    await page.fill('.snippet-test [data-param="project"]', "Clipet");
+    await page.waitForTimeout(250);
+    check("the editor previews the rendered text", (await page.locator(".snippet-test-output pre").textContent()) === "Hello Kim, welcome to Clipet. Bye Kim!");
+    await page.fill(".snippet-form textarea", "Hello {{name}}!");
+    await page.waitForTimeout(150);
+    check("removing a placeholder drops its parameter", JSON.stringify(await page.$$eval(".snippet-param-name", (els) => els.map((e) => e.textContent))) === JSON.stringify(["{{name}}"]));
+
+    // Per-OS versions: hidden until asked for, and must use the same parameters.
+    check("per-OS versions start collapsed", !(await page.locator(".snippet-variants").evaluate((d) => d.open)));
+    await page.click(".snippet-variants > summary");
+    await page.locator(".snippet-variant", { hasText: "Windows" }).locator('input[type="checkbox"]').check();
+    await page.fill('textarea[aria-label="Windows version"]', "Hi there");
+    check("a version missing a parameter is flagged inline", (await page.locator(".snippet-variant", { hasText: "Windows" }).locator(".snippet-error").textContent()) === "Missing {{name}}");
+    await page.fill('textarea[aria-label="Windows version"]', "Hi {{name}} (win)");
+    check("a matching version clears the warning", (await page.locator(".snippet-variant .snippet-error").count()) === 0);
+
+    await page.keyboard.press("Meta+Enter");
+    await page.waitForTimeout(150);
+    const saved = (await callsOf("snippet_save")).pop()?.input;
+    check("⌘↵ saves with the detected parameters", saved?.keyword === "greet" && saved?.parameters?.length === 1 && saved.parameters[0].name === "name", JSON.stringify(saved));
+    check("…and the per-OS version", JSON.stringify(saved?.variants) === JSON.stringify({ windows: "Hi {{name}} (win)" }), JSON.stringify(saved?.variants));
+
+    // The detail view lists each OS version.
+    await page.locator(".snippet-item", { hasText: ";killport" }).click();
+    check("the detail view shows other OS versions", (await page.locator(".snippet-variant-view").textContent()).includes("Windows version"));
+    await page.close();
+  }
+
+  // On Windows, filling in values previews (and pastes) the Windows version.
+  {
+    const page = await browser.newPage({ viewport: { width: 900, height: 660 } });
+    page.on("pageerror", (e) => errors.push("params-windows: " + e.message));
+    await page.addInitScript(() => { window.__paramSnippets = true; window.__platform = "windows"; });
+    await page.addInitScript(mockTauri, "history");
+    await page.goto(url);
+    await page.waitForSelector(".clip-item");
+    await page.click('button[aria-label="Snippets"]');
+    await page.locator(".snippet-item", { hasText: ";killport" }).click();
+    check("the detail view marks the version used here", (await page.locator(".snippet-variant-view").textContent()).includes("used on this computer"));
+    await page.keyboard.press("Enter");
+    await page.fill('[data-param="port"]', "5173");
+    await page.waitForTimeout(250);
+    check("the fill-in preview uses this OS's version", (await page.locator(".snippet-test-output pre").textContent()) === "Stop-Port 5173");
+    await page.close();
+  }
+
+  // ---------------- Detail panel action hierarchy ----------------
+  {
+    const page = await browser.newPage({ viewport: { width: 900, height: 600 } });
+    page.on("pageerror", (e) => errors.push("detail: " + e.message));
+    await page.addInitScript(mockTauri, "history");
+    await page.goto(url);
+    await page.waitForSelector(".clip-item");
+    await page.locator(".clip-item", { hasText: "hello world" }).click();
+    const buttons = page.locator(".preview-card .detail-actions button");
+    check("Paste is the first, primary action", (await buttons.first().getAttribute("class")).includes("primary") && (await buttons.first().textContent()).includes("Paste"));
+    check("Delete is last and styled as destructive", (await buttons.last().getAttribute("class")).includes("danger"));
+    check("Favorite and Pin report their state", (await page.locator('.detail-actions button[aria-pressed]').count()) === 2);
+    check("pinned items show an icon marker, not an emoji", (await page.locator(".clip-item", { hasText: "second text" }).locator(".clip-marker").count()) === 1);
+
+    // Sidebar tooltips: shown on hover, really visible (not clipped by the
+    // scrolling sidebar), gone on leave.
+    await page.hover('button[aria-label^="Favorites"]');
+    await page.waitForTimeout(450);
+    const tip = page.locator(".tooltip-bubble");
+    check("hovering a sidebar icon shows its name", (await tip.count()) === 1 && (await tip.textContent()).startsWith("Favorites"));
+    const visibleOnTop = await tip.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      const rail = document.getElementById("sidebar").getBoundingClientRect();
+      // The bubble ignores the pointer (so it never blocks clicks); let it be
+      // hit-tested for a moment to see what's really painted at its centre.
+      el.style.pointerEvents = "auto";
+      const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      el.style.pointerEvents = "";
+      return r.width > 0 && r.left >= rail.right && r.right <= window.innerWidth && (hit === el || el.contains(hit));
+    });
+    check("the tooltip is drawn beside the rail, not clipped", visibleOnTop);
+    await page.mouse.move(600, 300);
+    await page.waitForTimeout(50);
+    check("leaving the icon hides the tooltip", (await page.locator(".tooltip-bubble").count()) === 0);
+    await page.focus('button[aria-label="Settings"]');
+    await page.waitForTimeout(450);
+    check("keyboard focus shows the tooltip too", (await page.locator(".tooltip-bubble").textContent()) === "Settings");
+    await page.locator('button[aria-label="Settings"]').blur();
+
+    // Search: clear button appears with a query and clears it.
+    check("no clear button while search is empty", (await page.locator(".search-clear").count()) === 0);
+    await page.fill("#search-input", "second");
+    check("a query shows the clear button", (await page.locator(".search-clear").count()) === 1);
+    await page.click(".search-clear");
+    check("clear empties the search and keeps focus there", (await page.inputValue("#search-input")) === "" && await page.evaluate(() => document.activeElement?.id === "search-input"));
+    check("the search icon never intercepts clicks", await page.locator(".search-field-icon").evaluate((el) => getComputedStyle(el).pointerEvents === "none"));
+    await page.close();
+  }
+
+  // ---------------- Snippet backup: export / import ----------------
+  {
+    const page = await browser.newPage({ viewport: { width: 900, height: 700 } });
+    page.on("pageerror", (e) => errors.push("backup: " + e.message));
+    await page.addInitScript(mockTauri, "history");
+    await page.goto(url);
+    await page.waitForSelector(".clip-item");
+    await page.click('button[aria-label="Snippets"]');
+    await page.waitForSelector(".snippet-item");
+    await page.click('#preview-header button:has-text("Settings")');
+    await page.click("text=Export snippets…");
+    await page.waitForTimeout(150);
+    check("export says where the file went", (await page.locator("#toast").textContent()).includes("Downloads/clipet-snippets-2026-11-08.json"));
+    check("export mentions skipped image snippets", (await page.locator("#toast").textContent()).includes("1 image snippet not included"));
+    const file = JSON.stringify({ format: "clipet-snippets", version: 1, snippets: [
+      { keyword: "name", content: "dup" }, { keyword: "addr", content: "123 Example St" },
+    ] });
+    await page.setInputFiles('input[aria-label="Snippet file to import"]', { name: "s.json", mimeType: "application/json", buffer: Buffer.from(file) });
+    await page.waitForTimeout(200);
+    const report = await page.locator(".snippet-import-report").textContent();
+    check("import reports what it added and skipped", report.includes("Imported 1 snippet") && report.includes("skipped 1"), report);
+    check("…with the reason for each skip", report.includes("already in use"), report);
+    await page.click("text=Done");
+    check("imported snippets appear in the list", (await page.$$eval(".snippet-item .snippet-trigger", (els) => els.map((e) => e.textContent))).includes(";addr"));
+    await page.close();
+  }
+
+  // ---------------- Parameter popup (;keyword + Tab in another app) ----------------
+  {
+    const killport = {
+      token: 7, name: "Kill Port", trigger: ";killport", content: "lsof -tiTCP:{{port}} -sTCP:LISTEN | xargs kill", suffix: "exact",
+      parameters: [{ name: "port", kind: "integer", min: 1, max: 65535, required: true, default: null }], prefill: {},
+    };
+    const openPrompt = async (prompt, extra = {}) => {
+      const page = await browser.newPage({ viewport: { width: 440, height: 420 } });
+      page.on("pageerror", (e) => errors.push("prompt: " + e.message));
+      await page.addInitScript(([p, x]) => { window.__prompt = p; Object.assign(window, x); }, [prompt, extra]);
+      await page.addInitScript(mockTauri, "prompt");
+      await page.goto(url);
+      await page.waitForSelector(".prompt-card .param-field");
+      await page.waitForTimeout(250);
+      return page;
+    };
+    const callsOn = (page, cmd) => page.evaluate((cmd) => window.__calls.filter((c) => c.cmd === cmd).map((c) => c.args), cmd);
+
+    // Scenario 4: ;killport abc + Tab — the typed value is kept and explained.
+    let page = await openPrompt({ ...killport, prefill: { port: "abc" } });
+    check("popup shows the snippet it is for", (await page.locator(".prompt-header").textContent()).includes(";killport"));
+    check("an invalid inline value is kept", (await page.inputValue('[data-param="port"]')) === "abc");
+    check("…and explained right away", (await page.locator(".param-error").textContent()).includes("not a whole number"));
+    check("the field needing attention has focus", await page.evaluate(() => document.activeElement?.dataset.param === "port"));
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(100);
+    check("Enter with an invalid value inserts nothing", (await callsOn(page, "snippet_prompt_submit")).length === 0);
+    // Scenario 3: correct it and confirm.
+    await page.fill('[data-param="port"]', "8989");
+    await page.waitForTimeout(250);
+    check("the popup previews the exact text", (await page.locator(".snippet-test-output pre").textContent()) === "lsof -tiTCP:8989 -sTCP:LISTEN | xargs kill");
+    check("the popup says nothing is run", (await page.locator(".prompt-footer").textContent()).includes("nothing is run"));
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(100);
+    check("Enter confirms with the values", JSON.stringify(await callsOn(page, "snippet_prompt_submit")) === JSON.stringify([{ token: 7, values: { port: "8989" } }]));
+    await page.close();
+
+    // Scenario 6: cancel.
+    page = await openPrompt(killport);
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(100);
+    check("Esc cancels and returns to the app", JSON.stringify(await callsOn(page, "snippet_prompt_cancel")) === JSON.stringify([{ token: 7, returnFocus: true }]));
+    check("cancelling inserts nothing", (await callsOn(page, "snippet_prompt_submit")).length === 0);
+    await page.close();
+
+    // The original field couldn't be confirmed: say so, never fail silently.
+    page = await openPrompt(killport, { __promptSubmitFails: true });
+    await page.fill('[data-param="port"]', "5173");
+    await page.waitForTimeout(250);
+    await page.keyboard.press("Enter");
+    await page.waitForTimeout(150);
+    check("a refused insertion is explained", (await page.locator(".prompt-failure").textContent()).includes("nothing was inserted"));
+    check("…and reassures the shortcut was left alone", (await page.locator(".prompt-failure").textContent()).includes("left as it was"));
+    await page.click(".prompt-failure >> text=Close");
+    await page.waitForTimeout(100);
+    check("closing after a failure doesn't pull focus around", JSON.stringify(await callsOn(page, "snippet_prompt_cancel")) === JSON.stringify([{ token: 7, returnFocus: false }]));
+    await page.close();
+
+    // Several parameters, including a dropdown.
+    page = await openPrompt({
+      token: 9, name: "Deploy note", trigger: ";deployed", content: "Hello {{name}}, your deployment to {{environment}} is complete.", suffix: "exact",
+      parameters: [
+        { name: "name", kind: "text", min_length: null, max_length: null, pattern: null, required: true, default: null },
+        { name: "environment", kind: "dropdown", options: ["development", "staging", "production"], required: true, default: null },
+      ],
+      prefill: { name: "Kim" },
+    });
+    check("every missing value gets a field", (await page.$$(".prompt-card .param-field")).length === 2);
+    check("the first field still needing a value has focus", await page.evaluate(() => document.activeElement?.dataset.param === "environment"));
+    await page.selectOption('[data-param="environment"]', "staging");
+    await page.waitForTimeout(250);
+    check("multi-value result", (await page.locator(".snippet-test-output pre").textContent()) === "Hello Kim, your deployment to staging is complete.");
     await page.close();
   }
 
