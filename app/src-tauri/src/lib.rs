@@ -7,6 +7,7 @@ mod ocr;
 mod paste_target;
 mod retention;
 mod snippets;
+mod sync;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -185,6 +186,7 @@ fn update_item_text(app: tauri::AppHandle, id: String, content: String) -> Resul
     }
     let preview: String = content.chars().take(120).collect();
     db::update_text(&conn, &id, &content, &preview, &clipboard::hash_bytes(content.as_bytes()))?;
+    sync::journal::put(&conn, &id);
     let _ = app.emit("clipflow://item-updated", &id);
     Ok(())
 }
@@ -212,6 +214,7 @@ fn toggle_pinned(app: tauri::AppHandle, id: String, pinned: bool) {
     let data_dir = app.path().app_data_dir().expect("no app data dir");
     let conn = db::open(&data_dir);
     db::set_pinned(&conn, &id, pinned);
+    sync::journal::put(&conn, &id);
 }
 
 #[tauri::command]
@@ -219,6 +222,7 @@ fn delete_item(app: tauri::AppHandle, id: String) {
     let data_dir = app.path().app_data_dir().expect("no app data dir");
     let conn = db::open(&data_dir);
     db::delete_item(&conn, &data_dir, &id);
+    sync::journal::del(&conn, &id);
 }
 
 /// The default "Clear" action: removes everything except favorited items.
@@ -1383,6 +1387,7 @@ fn save_annotated_image_as_new(app: tauri::AppHandle, id: String, data_url: Stri
         &clipboard::hash_bytes(pixels.as_raw()),
     );
     db::mark_edited(&conn, &new_id);
+    sync::journal::put(&conn, &new_id);
     let _ = app.emit("clipflow://new-item", &new_id);
     ocr::wake(&app);
     Ok(new_id)
@@ -1444,6 +1449,7 @@ fn save_annotated_image(app: tauri::AppHandle, id: String, data_url: String) -> 
     // Keep duplicate detection truthful: the item now holds the edited pixels,
     // so re-copying the original image later creates a separate entry.
     db::set_content_hash(&conn, &id, &clipboard::hash_bytes(pixels.as_raw()));
+    sync::journal::put(&conn, &id);
     let _ = app.emit("clipflow://item-updated", &id);
     ocr::wake(&app);
     Ok(())
@@ -1660,7 +1666,20 @@ pub fn run() {
             open_file_entry,
             retention::history_retention_preview,
             retention::history_retention_set,
-            retention::history_clear_expired
+            retention::history_clear_expired,
+            sync::sync_status,
+            sync::sync_set_enabled,
+            sync::sync_save_settings,
+            sync::sync_set_paused,
+            sync::sync_rename_this_device,
+            sync::sync_create_invite,
+            sync::sync_copy_invite,
+            sync::sync_join,
+            sync::sync_decide_pairing,
+            sync::sync_cancel_pairing,
+            sync::sync_remove_device,
+            sync::sync_rename_device,
+            sync::sync_now
         ])
         .setup(move |app| {
             let handle = app.handle().clone();
@@ -1676,6 +1695,9 @@ pub fn run() {
             app.manage(ocr_service.clone());
             ocr_service.start();
             retention::start(handle.clone());
+            let sync_service = sync::SyncService::new(handle.clone(), data_dir.clone());
+            app.manage(sync_service.clone());
+            sync_service.start();
             clipboard::spawn_monitor(handle.clone(), data_dir, monitor.clone());
             #[cfg(all(feature = "e2e", target_os = "macos"))]
             e2e::start(

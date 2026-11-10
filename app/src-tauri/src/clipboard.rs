@@ -225,6 +225,7 @@ fn ingest_text(conn: &Connection, app: &AppHandle, text: &str, hash: &str) {
     let created_at = chrono::Utc::now().timestamp_millis();
     let kind = if looks_like_url(text) { "link" } else { "text" };
     db::insert_item(conn, &id, kind, text, &preview, "", created_at, hash);
+    crate::sync::journal::put(conn, &id);
     let _ = app.emit("clipflow://new-item", &id);
 }
 
@@ -239,6 +240,7 @@ fn ingest_image(
     // of storing (and OCR-ing) a second identical file.
     if let Some((existing, _)) = db::find_image_by_hash(conn, hash) {
         db::touch_item(conn, &existing, chrono::Utc::now().timestamp_millis());
+        crate::sync::journal::put(conn, &existing);
         let _ = app.emit("clipflow://new-item", &existing);
         return;
     }
@@ -261,6 +263,7 @@ fn ingest_image(
     db::insert_item(
         conn, &id, "image", &file_name, &preview, "", created_at, hash,
     );
+    crate::sync::journal::put(conn, &id);
     let _ = app.emit("clipflow://new-item", &id);
     crate::ocr::wake(app);
 }

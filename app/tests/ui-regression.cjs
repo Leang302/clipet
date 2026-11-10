@@ -64,10 +64,23 @@ function mockTauri(label) {
       variants: JSON.stringify({ windows: "Stop-Port {{port}}" }),
     });
   }
+  // Device Sync backend: a tiny state machine behind the sync_* commands.
+  const sync = {
+    settings: { enabled: false, paused: false, sync_text: true, sync_images: false, sync_pins: true, max_text_kb: 1024, max_image_mb: 10 },
+    pairing: { state: "idle" },
+    peers: [],
+  };
+  const syncStatus = () => ({
+    settings: { ...sync.settings }, device_name: "Test Mac", key_storage: "keychain", running: sync.settings.enabled, error: null,
+    node: sync.settings.enabled ? { device_id: "a".repeat(64), short_id: "aaaaaaaaaa", relay_connected: true, peers: sync.peers, pairing: sync.pairing } : null,
+  });
+  window.__syncPair = () => { sync.pairing = { state: "confirm", name: "Windows PC", code: "123 456" }; };
   // Fires an app event at the page's listeners, like the backend would.
   window.__emit = (event, payload = null) => calls
     .filter((c) => c.cmd === "plugin:event|listen" && c.args.event === event)
     .forEach((c) => window["__cb" + c.args.handler]?.({ event, id: 0, payload }));
+  // The real runtime provides this; unsubscribing an event listener calls it.
+  window.__TAURI_EVENT_PLUGIN_INTERNALS__ = { unregisterListener: () => {} };
   window.__TAURI_INTERNALS__ = {
     metadata: { currentWindow: { label }, currentWebview: { label } },
     transformCallback: (fn) => { const id = ++cb; window["__cb" + id] = fn; return id; },
@@ -133,6 +146,18 @@ function mockTauri(label) {
         case "snippet_prompt_cancel": window.__prompt = null; return null;
         case "snippet_settings_get": return { enabled: true, prefix: ";", trigger_mode: "space", escape_enabled: true, case_sensitive: true, default_pause_minutes: 15 };
         case "snippets_status": return { enabled: true, paused: false, paused_until: null, listener: "active", blocked_by: window.__blockedBy ?? null, platform: window.__platform ?? "macos" };
+        case "sync_status": case "sync_now": case "sync_join": return syncStatus();
+        case "sync_set_enabled": sync.settings.enabled = args.enabled; return syncStatus();
+        case "sync_save_settings": sync.settings = { ...args.settings, enabled: sync.settings.enabled, paused: sync.settings.paused }; return syncStatus();
+        case "sync_set_paused": sync.settings.paused = args.paused; return syncStatus();
+        case "sync_create_invite": sync.pairing = { state: "hosting", invite: "clipet-invite:abc", expires_at: Date.now() + 600000 }; return syncStatus();
+        case "sync_copy_invite": return null;
+        case "sync_decide_pairing":
+          if (args.approve) sync.peers = [{ id: "b".repeat(64), short_id: "bbbbbbbbbb", name: "Windows PC", online: true, added_at: 1, last_seen: Date.now(), last_sync: Date.now(), last_error: null }];
+          sync.pairing = args.approve ? { state: "done", name: "Windows PC" } : { state: "failed", reason: "Pairing was declined." };
+          return syncStatus();
+        case "sync_cancel_pairing": sync.pairing = { state: "idle" }; return syncStatus();
+        case "sync_remove_device": sync.peers = sync.peers.filter((p) => p.id !== args.id); return syncStatus();
         default: return null; // plugin:event|listen etc.
       }
     },
@@ -477,6 +502,29 @@ function mockTauri(label) {
     check("saving applies the chosen retention", JSON.stringify(await callsOf("history_retention_set")) === JSON.stringify([{ retention: { days: 7, include_favorites: false, include_pinned: false } }]));
     await page.click(".history-settings >> text=Pause 15 min");
     check("recording can be paused for a while", JSON.stringify(await callsOf("pause_monitoring")) === JSON.stringify([{ minutes: 15 }]) && (await page.locator(".history-settings").textContent()).includes("Paused until"));
+    // Device Sync: its own page inside Settings.
+    check("Device Sync is listed and off until enabled", /Device Sync\s*Off/.test(await page.locator(".history-settings").textContent()));
+    await page.click('.history-settings button:has-text("Manage…")');
+    await page.click(".history-settings >> text=Sync clipboard history with my other devices");
+    check("turning sync on calls the backend", JSON.stringify(await callsOf("sync_set_enabled")) === JSON.stringify([{ enabled: true }]));
+    await page.waitForSelector('.history-settings button:has-text("Add Device")');
+    check("images are off by default", !(await page.locator('.history-settings label:has-text("Images and screenshots") input').isChecked()));
+    await page.click('.history-settings button:has-text("Add Device")');
+    await page.waitForSelector(".ds-invite");
+    check("Add Device shows a one-time invitation with its expiry", (await page.locator(".ds-invite").inputValue()) === "clipet-invite:abc" && (await page.locator(".history-settings").textContent()).includes("expires in"));
+    await page.click('.history-settings button:has-text("Copy Invitation")');
+    check("the invitation is copied without entering history", (await callsOf("sync_copy_invite")).length === 1 && !(await callsOf("copy_text")).length);
+    await page.evaluate(() => { window.__syncPair(); window.__emit("clipet://sync-changed"); });
+    await page.waitForSelector(".ds-code");
+    check("a joining device needs approval and shows the code", (await page.locator(".ds-code").textContent()) === "123 456" && (await page.locator(".history-settings").textContent()).includes("Windows PC wants to sync"));
+    await page.click('.history-settings button:has-text("Approve")');
+    await page.waitForSelector(".ds-peers li");
+    check("approving lists the device as online", JSON.stringify(await callsOf("sync_decide_pairing")) === JSON.stringify([{ approve: true }]) && /Windows PC.*Online/.test(await page.locator(".ds-peers").textContent()));
+    await page.click('.history-settings button:has-text("OK")');
+    await page.click(".ds-peers >> text=Remove…");
+    check("removing a device asks first and says what it can't undo", (await page.locator(".history-settings").textContent()).includes("Items it already received stay on it"));
+    await page.keyboard.press("Escape");
+    check("Esc on the sync page goes back to Settings", (await page.locator(".history-settings").textContent()).includes("Keep history") && !(await callsOf("sync_remove_device")).length);
     await page.click(".history-settings >> text=Clear All History…");
     check("Clear All History asks first", (await page.locator(".history-settings").textContent()).includes("including favorites and pinned"));
     await page.keyboard.press("Escape");

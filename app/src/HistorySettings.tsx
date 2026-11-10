@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { ThemeChoice } from "./theme";
 import type { OcrLanguage, OcrStatus } from "./App";
+import { DeviceSync, syncSummary, useSyncStatus } from "./DeviceSync";
 
 export type Retention = { days: number; include_favorites: boolean; include_pinned: boolean };
 type RetentionStatus = { retention: Retention; eligible: number };
@@ -33,6 +34,8 @@ export function HistorySettings(props: {
   const [monitor, setMonitor] = useState<MonitoringStatus | null>(null);
   const [confirmClearAll, setConfirmClearAll] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [view, setView] = useState<"main" | "sync">("main");
+  const [syncStatus] = useSyncStatus();
 
   useEffect(() => {
     invoke<RetentionStatus>("history_retention_get").then((s) => {
@@ -51,7 +54,14 @@ export function HistorySettings(props: {
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { e.preventDefault(); e.stopImmediatePropagation(); confirmClearAll ? setConfirmClearAll(false) : onClose(); }
+      if (e.key !== "Escape") return;
+      // A field being edited on the sync page handles its own Escape.
+      if (view === "sync" && (e.target as HTMLElement | null)?.closest?.(".ds-rename")) return;
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      if (view === "sync") setView("main");
+      else if (confirmClearAll) setConfirmClearAll(false);
+      else onClose();
     };
     document.addEventListener("keydown", onKey, true);
     return () => document.removeEventListener("keydown", onKey, true);
@@ -101,6 +111,14 @@ export function HistorySettings(props: {
   return (
     <div className="modal-backdrop" onMouseDown={onClose}>
       <div className="recovery-dialog history-settings" role="dialog" aria-modal="true" aria-labelledby="history-settings-title" onMouseDown={(e) => e.stopPropagation()}>
+        {view === "sync" ? (
+          <>
+            <DeviceSync onBack={() => setView("main")} toast={toast} />
+            <div className="recovery-actions">
+              <button className="icon-btn" onClick={onClose}>Done</button>
+            </div>
+          </>
+        ) : (<>
         <div className="recovery-title" id="history-settings-title">Settings</div>
 
         <section>
@@ -137,6 +155,16 @@ export function HistorySettings(props: {
               )}
             </>
           )}
+        </section>
+
+        <section>
+          <div className="hs-row">
+            <span>Device Sync</span>
+            <span className="ds-inline">
+              <span className="hs-status" role="status">{syncSummary(syncStatus)}</span>
+              <button className="icon-btn" onClick={() => setView("sync")}>Manage…</button>
+            </span>
+          </div>
         </section>
 
         <section>
@@ -234,6 +262,7 @@ export function HistorySettings(props: {
         <div className="recovery-actions">
           <button className="icon-btn" onClick={onClose}>Done</button>
         </div>
+        </>)}
       </div>
     </div>
   );

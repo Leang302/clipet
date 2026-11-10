@@ -24,6 +24,9 @@ pub struct ClipItem {
     pub ocr_lines: Option<String>,
     /// Why the last recognition attempt failed, in plain language.
     pub ocr_error: Option<String>,
+    /// Endpoint id of the device this item was synced from; empty when it
+    /// was copied on this device.
+    pub origin: String,
 }
 
 pub const OCR_PENDING: i64 = 0;
@@ -34,7 +37,7 @@ pub const OCR_FAILED: i64 = 2;
 /// image can't crash-loop the app.
 pub const OCR_RUNNING: i64 = 3;
 
-const ITEM_COLUMNS: &str = "id, kind, content, preview, source_app, created_at, last_used_at, use_count, favorite, pinned, edited, ocr_status, ocr_text, ocr_lines, ocr_error";
+const ITEM_COLUMNS: &str = "id, kind, content, preview, source_app, created_at, last_used_at, use_count, favorite, pinned, edited, ocr_status, ocr_text, ocr_lines, ocr_error, origin";
 
 fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipItem> {
     Ok(ClipItem {
@@ -53,6 +56,7 @@ fn row_to_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClipItem> {
         ocr_text: row.get(12)?,
         ocr_lines: row.get(13)?,
         ocr_error: row.get(14)?,
+        origin: row.get(15)?,
     })
 }
 
@@ -102,6 +106,11 @@ pub fn open(data_dir: &PathBuf) -> Connection {
         // Which OCR version produced ocr_text; older ones are re-scanned.
         "ocr_version INTEGER NOT NULL DEFAULT 0",
         "ocr_error TEXT",
+        // Device sync (see docs/SYNC.md): where a synced item came from, and
+        // last-writer-wins clocks for its pinned state and its content.
+        "origin TEXT NOT NULL DEFAULT ''",
+        "pinned_at INTEGER NOT NULL DEFAULT 0",
+        "edited_at INTEGER NOT NULL DEFAULT 0",
     ] {
         conn.execute(&format!("ALTER TABLE clip_items ADD COLUMN {column}"), [])
             .ok();
@@ -116,7 +125,12 @@ pub fn open(data_dir: &PathBuf) -> Connection {
         [],
     )
     .ok();
+    crate::sync::store::migrate(&conn);
     conn
+}
+
+fn now_ms() -> i64 {
+    chrono::Utc::now().timestamp_millis()
 }
 
 pub fn get_setting(conn: &Connection, key: &str) -> Option<String> {
@@ -287,8 +301,8 @@ pub fn find_item_by_hash(conn: &Connection, kind: &str, hash: &str) -> Option<St
 
 pub fn update_text(conn: &Connection, id: &str, content: &str, preview: &str, hash: &str) -> Result<(), String> {
     conn.execute(
-        "UPDATE clip_items SET content = ?1, preview = ?2, content_hash = ?3, edited = 1 WHERE id = ?4",
-        params![content, preview, hash, id],
+        "UPDATE clip_items SET content = ?1, preview = ?2, content_hash = ?3, edited = 1, edited_at = ?4 WHERE id = ?5",
+        params![content, preview, hash, now_ms(), id],
     )
     .map(|_| ())
     .map_err(|e| format!("could not save the text: {e}"))
@@ -377,9 +391,9 @@ pub fn get_item(conn: &Connection, id: &str) -> Option<ClipItem> {
 /// An annotation changed the pixels, so the image is queued for OCR again.
 pub fn mark_edited(conn: &Connection, id: &str) {
     conn.execute(
-        "UPDATE clip_items SET edited = 1, ocr_status = ?1, ocr_text = NULL, ocr_lines = NULL, ocr_error = NULL
-         WHERE id = ?2",
-        params![OCR_PENDING, id],
+        "UPDATE clip_items SET edited = 1, edited_at = ?1, ocr_status = ?2, ocr_text = NULL, ocr_lines = NULL, ocr_error = NULL
+         WHERE id = ?3",
+        params![now_ms(), OCR_PENDING, id],
     )
     .ok();
 }
@@ -394,8 +408,8 @@ pub fn set_favorite(conn: &Connection, id: &str, favorite: bool) {
 
 pub fn set_pinned(conn: &Connection, id: &str, pinned: bool) {
     conn.execute(
-        "UPDATE clip_items SET pinned = ?1 WHERE id = ?2",
-        params![pinned as i64, id],
+        "UPDATE clip_items SET pinned = ?1, pinned_at = ?2 WHERE id = ?3",
+        params![pinned as i64, now_ms(), id],
     )
     .ok();
 }
