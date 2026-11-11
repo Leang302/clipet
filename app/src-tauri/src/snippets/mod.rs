@@ -177,6 +177,7 @@ fn build_live(conn: &rusqlite::Connection) -> Live {
             prefix,
             mode: settings.trigger_mode,
             escape_enabled: settings.escape_enabled,
+            undo_backspace: settings.undo_backspace,
         },
         settings,
         index,

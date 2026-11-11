@@ -331,6 +331,9 @@ pub struct SnippetSettings {
     pub escape_enabled: bool,
     pub case_sensitive: bool,
     pub default_pause_minutes: u32,
+    /// Backspace right after an expansion restores the typed shortcut. Off
+    /// by default: a Backspace then only deletes one character, as before.
+    pub undo_backspace: bool,
 }
 
 impl Default for SnippetSettings {
@@ -342,6 +345,7 @@ impl Default for SnippetSettings {
             escape_enabled: true,
             case_sensitive: true,
             default_pause_minutes: 15,
+            undo_backspace: false,
         }
     }
 }

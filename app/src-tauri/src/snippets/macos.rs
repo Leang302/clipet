@@ -10,8 +10,14 @@
 //! All injection runs on the main thread. enigo's layout-aware key lookup
 //! (needed for Cmd+V) uses Text Input Source APIs that abort the process when
 //! called from any other thread — the same crash fixed for normal paste.
+//!
+//! Before anything is erased, the worker asks the focused field (through
+//! Accessibility) for the few characters before the caret: that catches
+//! shortcuts completed out of order (`name`, Home, `;`, End, Space), refuses
+//! secure fields, and rejects a stale keystroke buffer. Fields that don't
+//! expose their text fall back to the keystroke buffer alone.
 
-use super::engine::{Decision, Engine, KeyInput, TriggerKey};
+use super::engine::{self, CaretContext, Decision, Engine, FieldText, KeyInput, TriggerKey};
 use super::{ListenerState, SnippetService};
 use crate::clipboard::{self, MonitorState};
 use core_foundation::base::TCFType;
@@ -46,6 +52,9 @@ const CLIPBOARD_RESTORE_DELAY: Duration = Duration::from_millis(600);
 const IMAGE_RESTORE_DELAY: Duration = Duration::from_millis(1500);
 
 mod keycode {
+    pub const Z: i64 = 6;
+    pub const X: i64 = 7;
+    pub const V: i64 = 9;
     pub const RETURN: i64 = 36;
     pub const TAB: i64 = 48;
     pub const SPACE: i64 = 49;
@@ -94,8 +103,10 @@ struct Job {
     decision: Decision,
     trigger: SendEvent,
     target_pid: i64,
-    /// Nothing typed before the word was seen; ask the field what precedes it.
-    verify_boundary: bool,
+    /// The trigger key (`None` for a Backspace that undoes an expansion).
+    key: Option<TriggerKey>,
+    /// The keystrokes saw whitespace before the word (see `engine::reconcile`).
+    anchored: bool,
 }
 
 struct Shared {
@@ -269,12 +280,12 @@ fn on_key_down(shared: &Shared, event: &CGEvent) -> CallbackResult {
     let mut engine = shared.engine.lock().unwrap();
     let generation = shared.service.generation();
     if shared.seen_generation.swap(generation, Ordering::SeqCst) != generation {
-        engine.reset();
+        engine.forget();
     }
     let target_pid = event.get_integer_value_field(EventField::EVENT_TARGET_UNIX_PROCESS_ID);
     let previous_pid = shared.last_target_pid.swap(target_pid, Ordering::SeqCst);
     if previous_pid != target_pid {
-        engine.reset();
+        engine.forget();
     }
     let input_text = classify(event);
     let is_trigger = matches!(input_text, Some(Classified::Trigger(_)));
@@ -288,7 +299,7 @@ fn on_key_down(shared: &Shared, event: &CGEvent) -> CallbackResult {
                 shared.service.is_expanding()
             ));
         }
-        engine.reset();
+        engine.forget();
         return CallbackResult::Keep;
     }
 
@@ -296,21 +307,16 @@ fn on_key_down(shared: &Shared, event: &CGEvent) -> CallbackResult {
         return CallbackResult::Keep;
     };
     let word_chars = engine.word_chars();
-    let verify_boundary = engine.word_starts_line();
+    let anchored = !engine.word_starts_line();
     let decision = shared.service.with_live(|config, index| {
         engine.feed(input_text.as_input(), config, index)
     });
-    if is_trigger {
+    if is_trigger || decision.swallows_trigger() {
         // Only the decision and the word's length are logged, never its text.
         super::diag(&format!(
-            "trigger: word of {word_chars} chars -> {}{} (target pid {target_pid}{})",
-            match &decision {
-                Decision::Pass => "pass",
-                Decision::Expand { .. } => "expand",
-                Decision::ExpandImage { .. } => "expand image",
-                Decision::Escape { .. } => "escape",
-                Decision::Prompt { .. } => "prompt",
-            },
+            "{}: word of {word_chars} chars -> {}{} (target pid {target_pid}{})",
+            if is_trigger { "trigger" } else { "backspace" },
+            decision.label(),
             if replay { ", replayed" } else { "" },
             if previous_pid != target_pid { ", target changed" } else { "" },
         ));
@@ -324,7 +330,11 @@ fn on_key_down(shared: &Shared, event: &CGEvent) -> CallbackResult {
         decision,
         trigger: SendEvent(event.clone()),
         target_pid,
-        verify_boundary,
+        key: match input_text {
+            Classified::Trigger(key) => Some(key),
+            _ => None,
+        },
+        anchored,
     };
     if shared.jobs.send(job).is_err() {
         *held = None;
@@ -338,6 +348,7 @@ enum Classified {
     Text(String),
     Backspace,
     Reset,
+    Edit,
     Trigger(TriggerKey),
 }
 
@@ -347,6 +358,7 @@ impl Classified {
             Classified::Text(text) => KeyInput::Text(text),
             Classified::Backspace => KeyInput::Backspace,
             Classified::Reset => KeyInput::Reset,
+            Classified::Edit => KeyInput::Edit,
             Classified::Trigger(key) => KeyInput::Trigger(*key),
         }
     }
@@ -354,12 +366,15 @@ impl Classified {
 
 fn classify(event: &CGEvent) -> Option<Classified> {
     let flags = event.get_flags();
+    let code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
     if flags.intersects(CGEventFlags::CGEventFlagCommand | CGEventFlags::CGEventFlagControl) {
         // Shortcuts (select all, paste, undo…) change text unpredictably.
-        return Some(Classified::Reset);
+        // ⌘V / ⌘X / ⌘Z may also bring in a shortcut unseen.
+        let edits = flags.intersects(CGEventFlags::CGEventFlagCommand)
+            && matches!(code, keycode::V | keycode::X | keycode::Z);
+        return Some(if edits { Classified::Edit } else { Classified::Reset });
     }
     let modified = flags.intersects(CGEventFlags::CGEventFlagAlternate);
-    let code = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
     match code {
         keycode::SPACE if !modified => Some(Classified::Trigger(TriggerKey::Space)),
         keycode::TAB
@@ -419,8 +434,38 @@ fn run_job(shared: &Shared, monitor: &Arc<MonitorState>, job: Job) {
         decision,
         trigger,
         target_pid,
-        verify_boundary,
+        key,
+        anchored,
     } = job;
+    // Ask the field before anything is erased. Accessibility clients may run
+    // off the main thread. The text is used for this one decision and
+    // dropped; only its outcome is logged.
+    let started = std::time::Instant::now();
+    let field = read_field();
+    let reconciled = shared.service.with_live(|config, index| {
+        engine::reconcile(decision, key, anchored, &field, config, index)
+    });
+    super::diag(&format!(
+        "field {} in {}ms -> {}",
+        field.label(),
+        started.elapsed().as_millis(),
+        reconciled.decision.label()
+    ));
+    drop(field);
+    if reconciled.from_field && reconciled.decision.swallows_trigger() {
+        shared.engine.lock().unwrap().adopt(key, &reconciled);
+    }
+    let decision = match reconciled.decision {
+        // Not a shortcut after all (or not safe): deliver the key unchanged.
+        // The replayed key is tracked by the tap like any other.
+        Decision::Pass | Decision::Check { .. } => {
+            shared.engine.lock().unwrap().reset();
+            replay(&trigger.0);
+            release_held(shared);
+            return;
+        }
+        other => other,
+    };
     let decision = match decision {
         Decision::Prompt {
             snippet_id,
@@ -458,9 +503,15 @@ fn run_job(shared: &Shared, monitor: &Arc<MonitorState>, job: Job) {
         Decision::Escape {
             delete_chars,
             insert,
+        }
+        | Decision::Undo {
+            delete_chars,
+            insert,
+            ..
         } => (delete_chars, Some(Insert::Text(insert)), None),
-        Decision::Pass => (0, Some(Insert::Text(String::new())), None),
-        Decision::Prompt { .. } => unreachable!("handled above"),
+        Decision::Pass | Decision::Check { .. } | Decision::Prompt { .. } => {
+            unreachable!("handled above")
+        }
     };
     let Some(insert) = insert else {
         shared.engine.lock().unwrap().reset();
@@ -483,7 +534,6 @@ fn run_job(shared: &Shared, monitor: &Arc<MonitorState>, job: Job) {
         let _ = sent.send(replace_on_main(
             &main_monitor,
             target_pid,
-            verify_boundary,
             delete_chars,
             &insert,
             None,
@@ -618,7 +668,6 @@ pub(super) fn complete_prompt(
         let _ = sent.send(replace_on_main(
             &main_monitor,
             i64::from(pid),
-            false,
             delete_chars,
             &insert,
             Some(&typed),
@@ -680,7 +729,6 @@ fn replay(event: &CGEvent) {
 fn replace_on_main(
     monitor: &Arc<MonitorState>,
     target_pid: i64,
-    verify_boundary: bool,
     delete_chars: usize,
     insert: &Insert,
     expected_before_caret: Option<&str>,
@@ -698,15 +746,7 @@ fn replace_on_main(
     if let Some(front) = frontmost_pid().filter(|pid| target_pid > 0 && i64::from(*pid) != target_pid) {
         super::diag(&format!("note: key target pid {target_pid}, frontmost app pid {front}"));
     }
-    if verify_boundary {
-        match text_before_word_is_boundary(delete_chars) {
-            Some(false) => return Outcome::Skipped("the shortcut is attached to earlier text"),
-            Some(true) => {}
-            // The field doesn't expose its text (some Electron apps): assume
-            // the shortcut starts a word rather than refuse to expand.
-            None => super::diag("note: field text unavailable, assuming word start"),
-        }
-    }
+    // (Word boundaries were settled by `engine::reconcile` before this.)
     if let Some(expected) = expected_before_caret {
         match text_before_caret_is(expected) {
             Some(false) => return Outcome::Skipped("the text before the cursor changed"),
@@ -802,11 +842,12 @@ impl Drop for Owned {
     }
 }
 
-/// Asks the focused text field (through Accessibility) whether the character
-/// just before the `word_chars`-long word at the caret is whitespace or the
-/// start of the field. Reads that single character only. `None` when the
-/// field doesn't expose its text or caret.
-fn text_before_word_is_boundary(word_chars: usize) -> Option<bool> {
+/// Reads the focused field's text around the caret through Accessibility:
+/// at most `engine::MAX_LINE_CHARS` characters before it and one after.
+/// Secure (password) fields and selections are `Blocked`; fields that don't
+/// expose their text or caret (some Electron apps, terminals) are
+/// `Unavailable`. Nothing read here is kept or logged.
+fn read_field() -> FieldText {
     use core_foundation::string::{CFString, CFStringRef};
 
     unsafe fn copy_attribute(element: *const c_void, name: &str) -> Option<Owned> {
@@ -818,49 +859,77 @@ fn text_before_word_is_boundary(word_chars: usize) -> Option<bool> {
         (status == 0 && !value.is_null()).then(|| Owned(value))
     }
 
+    unsafe fn string_for_range(element: *const c_void, location: isize, length: isize) -> Option<String> {
+        let range = CFRange { location, length };
+        let parameter = Owned(unsafe {
+            AXValueCreate(AX_VALUE_CF_RANGE, &range as *const _ as *const c_void)
+        });
+        let attribute = CFString::new("AXStringForRange");
+        let mut text = std::ptr::null();
+        let status = unsafe {
+            AXUIElementCopyParameterizedAttributeValue(
+                element,
+                attribute.as_concrete_TypeRef() as _,
+                parameter.0,
+                &mut text,
+            )
+        };
+        if status != 0 || text.is_null() {
+            return None;
+        }
+        Some(unsafe { CFString::wrap_under_create_rule(text as CFStringRef) }.to_string())
+    }
+
+    if unsafe { IsSecureEventInputEnabled() } != 0 {
+        return FieldText::Blocked;
+    }
     unsafe {
         let system = Owned(AXUIElementCreateSystemWide());
-        // Never let a slow app stall the main thread for long.
+        // Never let a slow app hold typing up for long.
         AXUIElementSetMessagingTimeout(system.0, 0.25);
-        let focused = copy_attribute(system.0, "AXFocusedUIElement")?;
-        let selection = copy_attribute(focused.0, "AXSelectedTextRange")?;
+        let Some(focused) = copy_attribute(system.0, "AXFocusedUIElement") else {
+            return FieldText::Unavailable;
+        };
+        if let Some(subrole) = copy_attribute(focused.0, "AXSubrole") {
+            let subrole = CFString::wrap_under_get_rule(subrole.0 as CFStringRef).to_string();
+            if subrole == "AXSecureTextField" {
+                return FieldText::Blocked;
+            }
+        }
+        let Some(selection) = copy_attribute(focused.0, "AXSelectedTextRange") else {
+            return FieldText::Unavailable;
+        };
         let mut caret = CFRange {
             location: 0,
             length: 0,
         };
         if !AXValueGetValue(selection.0, AX_VALUE_CF_RANGE, &mut caret as *mut _ as *mut c_void)
-            || caret.length != 0
+            || caret.location < 0
         {
-            return None;
+            return FieldText::Unavailable;
         }
-        let word_start = caret.location - word_chars as isize;
-        if word_start < 0 {
-            return None;
+        // Text is selected: the key replaces it, nothing to expand.
+        if caret.length != 0 {
+            return FieldText::Blocked;
         }
-        if word_start == 0 {
-            return Some(true);
-        }
-        let before = CFRange {
-            location: word_start - 1,
-            length: 1,
+        // Accessibility ranges count UTF-16 units; a pair split at the start
+        // only affects the first (partial) word, which is discarded anyway.
+        let wanted = engine::MAX_LINE_CHARS as isize;
+        let start = (caret.location - wanted).max(0);
+        let before = if caret.location == 0 {
+            String::new()
+        } else {
+            match string_for_range(focused.0, start, caret.location - start) {
+                Some(text) => text,
+                None => return FieldText::Unavailable,
+            }
         };
-        let parameter = Owned(AXValueCreate(
-            AX_VALUE_CF_RANGE,
-            &before as *const _ as *const c_void,
-        ));
-        let attribute = CFString::new("AXStringForRange");
-        let mut text = std::ptr::null();
-        let status = AXUIElementCopyParameterizedAttributeValue(
-            focused.0,
-            attribute.as_concrete_TypeRef() as _,
-            parameter.0,
-            &mut text,
-        );
-        if status != 0 || text.is_null() {
-            return None;
-        }
-        let text = CFString::wrap_under_create_rule(text as CFStringRef).to_string();
-        Some(text.chars().all(char::is_whitespace))
+        let after = string_for_range(focused.0, caret.location, 1).and_then(|t| t.chars().next());
+        FieldText::Known(CaretContext {
+            before,
+            at_start: start == 0,
+            after,
+        })
     }
 }
 

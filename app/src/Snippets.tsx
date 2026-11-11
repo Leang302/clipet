@@ -112,6 +112,7 @@ type SnippetSettings = {
   escape_enabled: boolean;
   case_sensitive: boolean;
   default_pause_minutes: number;
+  undo_backspace: boolean;
 };
 
 type SnippetStatus = {
@@ -1225,6 +1226,10 @@ function SettingsForm(props: { settings: SnippetSettings; onChange: (patch: Part
       <label className="snippet-check">
         <input type="checkbox" checked={settings.case_sensitive} onChange={(e) => onChange({ case_sensitive: e.target.checked })} />
         <span>Case-sensitive shortcuts</span>
+      </label>
+      <label className="snippet-check">
+        <input type="checkbox" checked={settings.undo_backspace} onChange={(e) => onChange({ undo_backspace: e.target.checked })} />
+        <span>Backspace right after an expansion brings back {settings.prefix}name</span>
       </label>
       <label>
         <span>Pause duration</span>

@@ -11,10 +11,17 @@
 //! never interleaves with other input. Unlike macOS, no main-thread hop is
 //! needed: `SendInput` and the clipboard work from any thread.
 //!
-//! The Win32 calls are declared here directly (as `macos.rs` does for Carbon
-//! and Accessibility) so this file needs no extra `windows` crate features.
+//! Before anything is erased, the worker asks the focused control (UI
+//! Automation's TextPattern) for the few characters before the caret: that
+//! catches shortcuts completed out of order (`name`, Home, `;`, End, Space),
+//! refuses password fields, and rejects a stale keystroke buffer. Controls
+//! without a TextPattern fall back to the keystroke buffer alone.
+//!
+//! The hook's Win32 calls are declared here directly (as `macos.rs` does for
+//! Carbon and Accessibility); only the UI Automation COM interfaces come from
+//! the `windows` crate.
 
-use super::engine::{Decision, Engine, KeyInput, TriggerKey};
+use super::engine::{self, Decision, Engine, KeyInput, TriggerKey};
 use super::{ListenerState, SnippetService};
 use crate::clipboard::{self, MonitorState};
 use std::ffi::c_void;
@@ -84,12 +91,17 @@ mod vk {
     pub const INSERT: u32 = 0x2D;
     pub const DELETE: u32 = 0x2E;
     pub const V: u16 = 0x56;
+    pub const X: u32 = 0x58;
+    pub const Y: u32 = 0x59;
+    pub const Z: u32 = 0x5A;
     pub const LWIN: u32 = 0x5B;
     pub const RWIN: u32 = 0x5C;
     pub const NUMLOCK: u32 = 0x90;
     pub const SCROLL: u32 = 0x91;
     pub const LSHIFT: u32 = 0xA0;
     pub const RMENU: u32 = 0xA5;
+    /// An input method is composing; the key's text isn't known yet.
+    pub const PROCESSKEY: u32 = 0xE5;
     pub const PACKET: u32 = 0xE7;
 }
 
@@ -194,6 +206,8 @@ unsafe extern "system" {
     fn SetForegroundWindow(hwnd: Handle) -> i32;
     fn IsWindow(hwnd: Handle) -> i32;
     fn GetGUIThreadInfo(thread_id: u32, info: *mut GuiThreadInfo) -> i32;
+    fn RealGetWindowClassW(hwnd: Handle, name: *mut u16, len: u32) -> u32;
+    fn GetWindowLongW(hwnd: Handle, index: i32) -> i32;
 }
 
 #[repr(C)]
@@ -300,7 +314,10 @@ struct KeyEvent {
 struct Job {
     decision: Decision,
     trigger: KeyEvent,
-    verify_boundary: bool,
+    /// The trigger key (`None` for a Backspace that undoes an expansion).
+    key: Option<TriggerKey>,
+    /// The keystrokes saw whitespace before the word (see `engine::reconcile`).
+    anchored: bool,
 }
 
 struct Shared {
@@ -445,12 +462,12 @@ fn on_key(shared: &Shared, info: &KbdLlHookStruct) -> bool {
     let mut engine = shared.engine.lock().unwrap();
     let generation = shared.service.generation();
     if shared.seen_generation.swap(generation, Ordering::SeqCst) != generation {
-        engine.reset();
+        engine.forget();
     }
     let (target_pid, layout) = foreground();
     let previous_pid = shared.last_target_pid.swap(target_pid, Ordering::SeqCst);
     if previous_pid != target_pid {
-        engine.reset();
+        engine.forget();
     }
     let input_text = classify(&event, layout);
     let is_trigger = matches!(input_text, Some(Classified::Trigger(_)));
@@ -464,7 +481,7 @@ fn on_key(shared: &Shared, info: &KbdLlHookStruct) -> bool {
                 shared.service.is_expanding()
             ));
         }
-        engine.reset();
+        engine.forget();
         return false;
     }
 
@@ -472,21 +489,16 @@ fn on_key(shared: &Shared, info: &KbdLlHookStruct) -> bool {
         return false;
     };
     let word_chars = engine.word_chars();
-    let verify_boundary = engine.word_starts_line();
+    let anchored = !engine.word_starts_line();
     let decision = shared.service.with_live(|config, index| {
         engine.feed(input_text.as_input(), config, index)
     });
-    if is_trigger {
+    if is_trigger || decision.swallows_trigger() {
         // Only the decision and the word's length are logged, never its text.
         super::diag(&format!(
-            "trigger: word of {word_chars} chars -> {}{} (target pid {target_pid}{})",
-            match &decision {
-                Decision::Pass => "pass",
-                Decision::Expand { .. } => "expand",
-                Decision::ExpandImage { .. } => "expand image",
-                Decision::Escape { .. } => "escape",
-                Decision::Prompt { .. } => "prompt",
-            },
+            "{}: word of {word_chars} chars -> {}{} (target pid {target_pid}{})",
+            if is_trigger { "trigger" } else { "backspace" },
+            decision.label(),
             if replay { ", replayed" } else { "" },
             if previous_pid != target_pid { ", target changed" } else { "" },
         ));
@@ -499,7 +511,11 @@ fn on_key(shared: &Shared, info: &KbdLlHookStruct) -> bool {
     let job = Job {
         decision,
         trigger: event,
-        verify_boundary,
+        key: match input_text {
+            Classified::Trigger(key) => Some(key),
+            _ => None,
+        },
+        anchored,
     };
     if shared.jobs.send(job).is_err() {
         *held = None;
@@ -532,6 +548,7 @@ enum Classified {
     Text(String),
     Backspace,
     Reset,
+    Edit,
     Trigger(TriggerKey),
 }
 
@@ -541,6 +558,7 @@ impl Classified {
             Classified::Text(text) => KeyInput::Text(text),
             Classified::Backspace => KeyInput::Backspace,
             Classified::Reset => KeyInput::Reset,
+            Classified::Edit => KeyInput::Edit,
             Classified::Trigger(key) => KeyInput::Trigger(*key),
         }
     }
@@ -567,13 +585,18 @@ fn classify(event: &KeyEvent, layout: Handle) -> Option<Classified> {
     if key_down(vk::LWIN) || key_down(vk::RWIN) || ctrl != alt {
         // Shortcuts (select all, paste, undo, Alt menus…) change text
         // unpredictably. Ctrl+Alt together is AltGr, which types characters.
-        return Some(Classified::Reset);
+        // Paste, cut, undo and redo may also bring in a shortcut unseen.
+        let edits = ctrl && !alt && matches!(code, vk::X | vk::Y | vk::Z | 0x56);
+        return Some(if edits { Classified::Edit } else { Classified::Reset });
     }
     let alt_gr = ctrl && alt;
     match code {
         vk::SPACE if !alt_gr => Some(Classified::Trigger(TriggerKey::Space)),
         vk::TAB if !alt_gr && !shift => Some(Classified::Trigger(TriggerKey::Tab)),
         vk::BACK if !alt_gr => Some(Classified::Backspace),
+        // Shift+Insert pastes, Shift+Delete cuts.
+        vk::INSERT | vk::DELETE if shift && !alt_gr => Some(Classified::Edit),
+        vk::PROCESSKEY => Some(Classified::Reset),
         vk::SPACE | vk::TAB | vk::BACK => Some(Classified::Reset),
         vk::RETURN
         | vk::ESCAPE
@@ -639,8 +662,39 @@ fn run_job(shared: &Shared, monitor: &Arc<MonitorState>, job: Job) {
     let Job {
         decision,
         trigger,
-        verify_boundary,
+        key,
+        anchored,
     } = job;
+    // Ask the field before anything is erased. The text is used for this one
+    // decision and dropped; only its outcome is logged.
+    let started = std::time::Instant::now();
+    let (field, why) = field::read();
+    let reconciled = shared.service.with_live(|config, index| {
+        engine::reconcile(decision, key, anchored, &field, config, index)
+    });
+    super::diag(&format!(
+        "field {}{}{} in {}ms -> {}",
+        field.label(),
+        if why.is_empty() { "" } else { ": " },
+        why,
+        started.elapsed().as_millis(),
+        reconciled.decision.label()
+    ));
+    drop(field);
+    if reconciled.from_field && reconciled.decision.swallows_trigger() {
+        shared.engine.lock().unwrap().adopt(key, &reconciled);
+    }
+    let decision = match reconciled.decision {
+        // Not a shortcut after all (or not safe): deliver the key unchanged.
+        // The replayed key is tracked by the hook like any other.
+        Decision::Pass | Decision::Check { .. } => {
+            shared.engine.lock().unwrap().reset();
+            replay_trigger(trigger);
+            release_held(shared);
+            return;
+        }
+        other => other,
+    };
     let decision = match decision {
         Decision::Prompt {
             snippet_id,
@@ -678,9 +732,15 @@ fn run_job(shared: &Shared, monitor: &Arc<MonitorState>, job: Job) {
         Decision::Escape {
             delete_chars,
             insert,
+        }
+        | Decision::Undo {
+            delete_chars,
+            insert,
+            ..
         } => (delete_chars, Some(Insert::Text(insert)), None),
-        Decision::Pass => (0, Some(Insert::Text(String::new())), None),
-        Decision::Prompt { .. } => unreachable!("handled above"),
+        Decision::Pass | Decision::Check { .. } | Decision::Prompt { .. } => {
+            unreachable!("handled above")
+        }
     };
     let Some(insert) = insert else {
         shared.engine.lock().unwrap().reset();
@@ -691,7 +751,7 @@ fn run_job(shared: &Shared, monitor: &Arc<MonitorState>, job: Job) {
     let is_image = matches!(insert, Insert::Image(_));
 
     let started = std::time::Instant::now();
-    let outcome = replace(monitor, verify_boundary, delete_chars, &insert);
+    let outcome = replace(monitor, delete_chars, &insert);
     let elapsed = started.elapsed().as_millis();
     match &outcome {
         Outcome::Done { restore } => super::diag(&format!(
@@ -764,7 +824,7 @@ pub(super) fn complete_prompt(
         return Err("The text field you were typing in no longer has focus, so nothing was inserted.".to_string());
     }
     *shared.held.lock().unwrap() = Some(Vec::new());
-    let outcome = replace(monitor, false, pending.delete_chars, &Insert::Text(text.to_string()));
+    let outcome = replace(monitor, pending.delete_chars, &Insert::Text(text.to_string()));
     // Whatever happened, the engine no longer knows the text at the caret.
     shared.engine.lock().unwrap().reset();
     release_held(shared);
@@ -846,22 +906,11 @@ fn send(inputs: &[Input]) -> u32 {
     }
 }
 
-fn replace(
-    monitor: &Arc<MonitorState>,
-    verify_boundary: bool,
-    delete_chars: usize,
-    insert: &Insert,
-) -> Outcome {
+fn replace(monitor: &Arc<MonitorState>, delete_chars: usize, insert: &Insert) -> Outcome {
     // IMEs (Korean, Japanese, Chinese…) compose text the hook can't see.
     // Never rewrite text while one is composing.
     if input_method_active() {
         return Outcome::Skipped("an input method is active");
-    }
-    if verify_boundary {
-        // Windows has no cheap way to read the character before the caret in
-        // every app. Like macOS when a field hides its text, assume the
-        // shortcut starts a word rather than refuse to expand.
-        super::diag("note: text before the shortcut is unknown, assuming word start");
     }
 
     let typed = match insert {
@@ -1079,6 +1128,160 @@ impl ClipboardRestore {
                 }
             }
             CloseClipboard();
+        }
+    }
+}
+
+/// Reads the focused control's text around the caret through UI Automation
+/// (TextPattern). Runs on the replacement worker only, never in the hook.
+mod field {
+    use super::engine::{CaretContext, FieldText, MAX_LINE_CHARS};
+    use windows::Win32::System::Com::{
+        CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
+    };
+    use windows::Win32::UI::Accessibility::{
+        CUIAutomation, CUIAutomation8, IUIAutomation, IUIAutomation2, IUIAutomationTextPattern,
+        TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start, TextUnit_Character,
+        UIA_TextPatternId,
+    };
+    use windows::core::Interface;
+
+    /// A slow or hung app must not hold typing up for long; on timeout the
+    /// keystroke buffer decides as before.
+    const TIMEOUT_MS: u32 = 250;
+
+    thread_local! {
+        static AUTOMATION: Option<IUIAutomation> = create();
+    }
+
+    fn create() -> Option<IUIAutomation> {
+        unsafe {
+            // Already initialized (in either mode) is fine: COM is usable.
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let automation: IUIAutomation =
+                CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER)
+                    .or_else(|_| CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER))
+                    .ok()?;
+            if let Ok(timeouts) = automation.cast::<IUIAutomation2>() {
+                let _ = timeouts.SetConnectionTimeout(TIMEOUT_MS);
+                let _ = timeouts.SetTransactionTimeout(TIMEOUT_MS);
+            }
+            Some(automation)
+        }
+    }
+
+    /// The field's text, or why it couldn't be read (a step name, for the
+    /// diagnostic log; never any text).
+    pub fn read() -> (FieldText, &'static str) {
+        AUTOMATION.with(|automation| match automation {
+            Some(automation) => match read_with(automation) {
+                Ok(field) => (field, ""),
+                // Classic Win32 edit controls often have no TextPattern
+                // (e.g. superclassed ones in WinForms and older dialogs).
+                Err(step) => match read_edit_control() {
+                    Some(field) => (field, ""),
+                    None => (FieldText::Unavailable, step),
+                },
+            },
+            None => match read_edit_control() {
+                Some(field) => (field, ""),
+                None => (FieldText::Unavailable, "UI Automation unavailable"),
+            },
+        })
+    }
+
+    /// The focused control, when it is a standard Edit or RichEdit control:
+    /// read with EM_GETSEL and WM_GETTEXT, which Windows marshals across
+    /// processes. Only fields up to 64K characters (EM_GETSEL's limit).
+    fn read_edit_control() -> Option<FieldText> {
+        use super::{
+            GetForegroundWindow, GetWindowLongW, Handle, RealGetWindowClassW, SMTO_ABORTIFHUNG,
+            SendMessageTimeoutW, focused_control,
+        };
+        const GWL_STYLE: i32 = -16;
+        const ES_PASSWORD: i32 = 0x20;
+        const WM_GETTEXT: u32 = 0x000D;
+        const WM_GETTEXTLENGTH: u32 = 0x000E;
+        const EM_GETSEL: u32 = 0x00B0;
+        unsafe {
+            let hwnd = focused_control(GetForegroundWindow()) as Handle;
+            if hwnd.is_null() {
+                return None;
+            }
+            let mut class = [0u16; 64];
+            let len = RealGetWindowClassW(hwnd, class.as_mut_ptr(), class.len() as u32) as usize;
+            let class = String::from_utf16_lossy(&class[..len.min(class.len())]).to_ascii_lowercase();
+            if class != "edit" && !class.starts_with("richedit") {
+                return None;
+            }
+            if GetWindowLongW(hwnd, GWL_STYLE) & ES_PASSWORD != 0 {
+                return Some(FieldText::Blocked);
+            }
+            let send = |msg: u32, wparam: usize, lparam: isize| {
+                let mut result = 0usize;
+                let ok = SendMessageTimeoutW(hwnd, msg, wparam, lparam, SMTO_ABORTIFHUNG, 250, &mut result);
+                (ok != 0).then_some(result)
+            };
+            let length = send(WM_GETTEXTLENGTH, 0, 0)?;
+            if length > 0xFFFF {
+                return None;
+            }
+            let selection = send(EM_GETSEL, 0, 0)?;
+            let (start, end) = (selection & 0xFFFF, (selection >> 16) & 0xFFFF);
+            if start != end {
+                return Some(FieldText::Blocked);
+            }
+            let mut buffer = vec![0u16; length + 1];
+            let copied = send(WM_GETTEXT, buffer.len(), buffer.as_mut_ptr() as isize)?;
+            let text = &buffer[..copied.min(length)];
+            let caret = end.min(text.len());
+            let from = caret.saturating_sub(MAX_LINE_CHARS);
+            Some(FieldText::Known(CaretContext {
+                before: String::from_utf16_lossy(&text[from..caret]),
+                at_start: from == 0,
+                after: text.get(caret).and_then(|&unit| char::from_u32(u32::from(unit))),
+            }))
+        }
+    }
+
+    fn read_with(automation: &IUIAutomation) -> Result<FieldText, &'static str> {
+        unsafe {
+            let element = automation.GetFocusedElement().map_err(|_| "no focused element")?;
+            if element.CurrentIsPassword().map_err(|_| "password state")?.as_bool() {
+                return Ok(FieldText::Blocked);
+            }
+            let pattern: IUIAutomationTextPattern = element
+                .GetCurrentPatternAs(UIA_TextPatternId)
+                .map_err(|_| "no text pattern")?;
+            let selection = pattern.GetSelection().map_err(|_| "no selection")?;
+            if selection.Length().map_err(|_| "no selection")? != 1 {
+                return Err("no caret");
+            }
+            let caret = selection.GetElement(0).map_err(|_| "no caret")?;
+            // Text is selected: the key replaces it, nothing to expand.
+            if caret
+                .CompareEndpoints(TextPatternRangeEndpoint_Start, &caret, TextPatternRangeEndpoint_End)
+                .map_err(|_| "caret range")?
+                != 0
+            {
+                return Ok(FieldText::Blocked);
+            }
+            let before = caret.Clone().map_err(|_| "caret range")?;
+            let wanted = MAX_LINE_CHARS as i32;
+            let moved = before
+                .MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character, -wanted)
+                .map_err(|_| "move range")?;
+            let text = before.GetText(-1).map_err(|_| "range text")?.to_string();
+            let next = caret.Clone().map_err(|_| "caret range")?;
+            let after = match next.MoveEndpointByUnit(TextPatternRangeEndpoint_End, TextUnit_Character, 1) {
+                Ok(1) => next.GetText(-1).ok().and_then(|t| t.to_string().chars().next()),
+                _ => None,
+            };
+            Ok(FieldText::Known(CaretContext {
+                before: text,
+                at_start: moved.unsigned_abs() < wanted as u32,
+                after,
+            }))
         }
     }
 }
