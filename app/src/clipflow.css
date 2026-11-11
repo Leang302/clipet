@@ -586,3 +586,28 @@ textarea.text-viewer-body.mono { font-family: var(--mono); }
 
 .snippet-note { margin: 0; font-size: 12px; line-height: 1.5; color: var(--text-muted); padding: 8px 10px; border-radius: 7px; background: var(--bg-panel-alt); }
 .snippet-status-help { flex-shrink: 0; font-size: 11px; color: var(--accent); text-decoration: underline dotted; cursor: help; }
+
+/* Clipet Connect */
+.ds-heading { font-weight: 600; font-size: 13px; }
+.ds-live { background: var(--accent-soft); border-radius: 10px; padding: 8px 10px !important; margin: 6px 0; border-bottom: none !important; }
+.ds-grants { display: flex; flex-wrap: wrap; gap: 2px 14px; padding-left: 16px; }
+.ds-grants .hs-check { margin: 2px 0; }
+.ds-arrange { margin: 6px 0 8px; }
+.ds-desk { position: relative; height: 150px; margin-top: 6px; border: 1px dashed var(--border-strong); border-radius: 10px; touch-action: none; user-select: none; }
+.ds-screen { position: absolute; width: 100px; height: 40px; display: flex; flex-direction: column; align-items: center; justify-content: center; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--bg-panel); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 4px; box-sizing: border-box; cursor: grab; }
+.ds-screen span { font-size: 10px; color: var(--text-muted); }
+.ds-self { left: calc(50% - 50px); top: calc(50% - 20px); cursor: default; border-color: var(--accent); }
+.ds-left { left: calc(50% - 156px); top: calc(50% - 20px); }
+.ds-right { left: calc(50% + 56px); top: calc(50% - 20px); }
+.ds-top { left: calc(50% - 50px); top: calc(50% - 66px); }
+.ds-bottom { left: calc(50% - 50px); top: calc(50% + 26px); }
+.ds-dragging { opacity: 0.35; }
+.ds-ghost { pointer-events: none; opacity: 0.85; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.2); }
+.ds-tray { display: flex; gap: 8px; margin-top: 6px; }
+.ds-unplaced { position: static; }
+[data-window="connect"], [data-window="connect"] body { background: transparent; }
+.connect-banner { display: flex; align-items: center; gap: 10px; margin: 6px; padding: 8px 12px; border-radius: 999px; background: var(--bg-panel); border: 1px solid var(--border-strong); box-shadow: 0 6px 20px rgba(0, 0, 0, 0.18); font-size: 12.5px; color: var(--text-main); }
+.connect-banner-dot { width: 8px; height: 8px; border-radius: 50%; background: #2fb36d; flex-shrink: 0; }
+.connect-banner-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.connect-banner-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.ds-nearby { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }

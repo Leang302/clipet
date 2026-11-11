@@ -6,6 +6,7 @@ mod ocr;
 #[cfg(target_os = "macos")]
 mod paste_target;
 mod retention;
+mod input;
 mod snippets;
 mod sync;
 
@@ -1675,11 +1676,18 @@ pub fn run() {
             sync::sync_create_invite,
             sync::sync_copy_invite,
             sync::sync_join,
+            sync::sync_join_nearby,
             sync::sync_decide_pairing,
             sync::sync_cancel_pairing,
             sync::sync_remove_device,
             sync::sync_rename_device,
-            sync::sync_now
+            sync::sync_now,
+            sync::connect_set_device,
+            sync::input_save_settings,
+            sync::input_switch_to,
+            sync::input_stop,
+            sync::input_answer,
+            sync::input_status
         ])
         .setup(move |app| {
             let handle = app.handle().clone();

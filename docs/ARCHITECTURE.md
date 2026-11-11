@@ -90,9 +90,9 @@ Destination applications still decide which pasteboard items and formats they ac
 - `snippets/windows.rs` is the `WH_KEYBOARD_LL` hook behind the same interface. It expands static and inline-argument snippets and opens the parameter popup; a confirmation re-activates the captured window and inserts only if the same control still has focus (Windows can't read the text before the caret in general).
 - `snippets/transfer.rs` exports text snippets to a versioned JSON file and imports such files, validating every record with the editor's rules and never overwriting an existing snippet.
 
-## Device Sync
+## Clipet Connect (device sync and input sharing)
 
-Peer-to-peer history sync between paired devices over iroh (QUIC, hole punching, relay fallback), in `src-tauri/src/sync/`. Capture and the history commands call `sync::journal` after each change; a per-device outbox (`sync_events`) and per-peer cursors in `clipflow.sqlite3` make delivery restart-safe. Design, conflict policy, security model, third-party services and the two-device test plan: `docs/SYNC.md`.
+Peer-to-peer history sync between paired devices over iroh (QUIC, hole punching, relay fallback), in `src-tauri/src/sync/`. Capture and the history commands call `sync::journal` after each change; a per-device outbox (`sync_events`) and per-peer cursors in `clipflow.sqlite3` make delivery restart-safe. Clipboard sync design: `docs/SYNC.md`. Devices, pairing and mouse / keyboard sharing (`src-tauri/src/input/`): `docs/CONNECT.md`.
 
 ## Known gaps (tracked, not hidden)
 

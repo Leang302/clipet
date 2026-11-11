@@ -37,10 +37,13 @@ iroh = "=1.3.0"
 tokio = { version = "1.54.1", features = ["sync", "time", "macros", "io-util", "rt-multi-thread"] }
 keyring = { version = "3", features = ["apple-native", "windows-native"] }
 getrandom = "0.3.4"
+iroh-mdns-address-lookup = "=0.6.0"
+spake2 = "0.4.0"
+n0-future = "=0.3.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
-core-graphics = "0.25"
+core-graphics = { version = "0.25", features = ["highsierra"] }
 foreign-types = "0.5"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["libc", "NSPasteboard", "NSPasteboardItem", "NSRunningApplication", "NSWorkspace", "std"] }

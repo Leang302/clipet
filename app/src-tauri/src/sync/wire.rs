@@ -17,17 +17,45 @@ pub const MAX_BLOB_BYTES: u64 = super::store::MAX_IMAGE_MB as u64 * 1024 * 1024;
 #[serde(tag = "t", rename_all = "snake_case")]
 pub enum Frame {
     /// Opens a sync stream: "send me your changes after `cursor`".
-    Request { version: u32, cursor: i64, prefs: Prefs, addr: Option<String> },
+    Request {
+        version: u32,
+        cursor: i64,
+        prefs: Prefs,
+        addr: Option<String>,
+        /// False when the asking device doesn't sync clipboard history with
+        /// us (only presence is wanted).
+        #[serde(default = "yes")]
+        items: bool,
+    },
     /// One logged change. For images, `blob_len` bytes of PNG follow.
     Event { seq: i64, op: String, item_id: String, at: i64, item: Option<ItemState>, blob_len: u64 },
     /// Everything up to `seq` has been sent (or skipped by filters).
     CaughtUp { seq: i64 },
     Heartbeat,
-    PairHello { version: u32, secret: String, name: String, addr: Option<String> },
+    PairHello {
+        version: u32,
+        /// The invitation secret (hex); empty when pairing with a code.
+        secret: String,
+        name: String,
+        addr: Option<String>,
+        /// SPAKE2 message (hex) when pairing with a nearby device's code.
+        #[serde(default)]
+        spake: Option<String>,
+    },
+    /// The host's SPAKE2 message.
+    PairSpake { msg: String },
+    /// Key confirmation: proof that this side derived the same key.
+    PairProof { mac: String },
+    /// The joining device's user confirmed the verification code.
+    PairConfirm,
     PairPending { code: String },
     PairAccepted { name: String },
     PairRejected { reason: String },
     PairAck,
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn invalid(msg: &str) -> io::Error {

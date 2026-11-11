@@ -159,7 +159,7 @@ export function HistorySettings(props: {
 
         <section>
           <div className="hs-row">
-            <span>Device Sync</span>
+            <span>Clipet Connect</span>
             <span className="ds-inline">
               <span className="hs-status" role="status">{syncSummary(syncStatus)}</span>
               <button className="icon-btn" onClick={() => setView("sync")}>Manage…</button>

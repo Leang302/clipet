@@ -66,15 +66,19 @@ function mockTauri(label) {
   }
   // Device Sync backend: a tiny state machine behind the sync_* commands.
   const sync = {
-    settings: { enabled: false, paused: false, sync_text: true, sync_images: false, sync_pins: true, max_text_kb: 1024, max_image_mb: 10 },
+    settings: { enabled: false, clipboard: true, paused: false, sync_text: true, sync_images: false, sync_pins: true, max_text_kb: 1024, max_image_mb: 10 },
+    input: { enabled: false, mouse: true, keyboard: true, edge_switch: true, hotkey_switch: true, edge_delay_ms: 0, require_confirmation: true, swap_ctrl_cmd: true, invert_scroll: false, allow_relayed: false },
     pairing: { state: "idle" },
     peers: [],
+    nearby: [],
   };
   const syncStatus = () => ({
     settings: { ...sync.settings }, device_name: "Test Mac", key_storage: "keychain", running: sync.settings.enabled, error: null,
-    node: sync.settings.enabled ? { device_id: "a".repeat(64), short_id: "aaaaaaaaaa", relay_connected: true, peers: sync.peers, pairing: sync.pairing } : null,
+    node: sync.settings.enabled ? { device_id: "a".repeat(64), short_id: "aaaaaaaaaa", relay_connected: true, peers: sync.peers, pairing: sync.pairing, nearby: sync.nearby } : null,
+    input: { settings: { ...sync.input }, permission: { granted: true, hint: "" }, supported: true, mode: { state: "idle" }, request: null, last_error: null },
   });
   window.__syncPair = () => { sync.pairing = { state: "confirm", name: "Windows PC", code: "123 456" }; };
+  window.__syncNearby = () => { sync.nearby = [{ id: "c".repeat(64), short_id: "cccccccccc", name: "Kim's MacBook" }]; };
   // Fires an app event at the page's listeners, like the backend would.
   window.__emit = (event, payload = null) => calls
     .filter((c) => c.cmd === "plugin:event|listen" && c.args.event === event)
@@ -146,18 +150,28 @@ function mockTauri(label) {
         case "snippet_prompt_cancel": window.__prompt = null; return null;
         case "snippet_settings_get": return { enabled: true, prefix: ";", trigger_mode: "space", escape_enabled: true, case_sensitive: true, default_pause_minutes: 15 };
         case "snippets_status": return { enabled: true, paused: false, paused_until: null, listener: "active", blocked_by: window.__blockedBy ?? null, platform: window.__platform ?? "macos" };
-        case "sync_status": case "sync_now": case "sync_join": return syncStatus();
+        case "sync_status": case "sync_now": case "sync_join": case "sync_join_nearby": return syncStatus();
         case "sync_set_enabled": sync.settings.enabled = args.enabled; return syncStatus();
         case "sync_save_settings": sync.settings = { ...args.settings, enabled: sync.settings.enabled, paused: sync.settings.paused }; return syncStatus();
         case "sync_set_paused": sync.settings.paused = args.paused; return syncStatus();
-        case "sync_create_invite": sync.pairing = { state: "hosting", invite: "clipet-invite:abc", expires_at: Date.now() + 600000 }; return syncStatus();
+        case "sync_create_invite": sync.pairing = { state: "hosting", invite: "clipet-invite:abc", code: "482 913", expires_at: Date.now() + 600000 }; return syncStatus();
         case "sync_copy_invite": return null;
         case "sync_decide_pairing":
-          if (args.approve) sync.peers = [{ id: "b".repeat(64), short_id: "bbbbbbbbbb", name: "Windows PC", online: true, added_at: 1, last_seen: Date.now(), last_sync: Date.now(), last_error: null }];
+          if (args.approve) sync.peers = [{ id: "b".repeat(64), short_id: "bbbbbbbbbb", name: "Windows PC", online: true, added_at: 1, last_seen: Date.now(), last_sync: Date.now(), last_error: null, allow_clipboard: true, allow_control: false, side: null }];
           sync.pairing = args.approve ? { state: "done", name: "Windows PC" } : { state: "failed", reason: "Pairing was declined." };
           return syncStatus();
         case "sync_cancel_pairing": sync.pairing = { state: "idle" }; return syncStatus();
         case "sync_remove_device": sync.peers = sync.peers.filter((p) => p.id !== args.id); return syncStatus();
+        case "connect_set_device":
+          sync.peers = sync.peers.map((p) => p.id !== args.id ? p : {
+            ...p,
+            ...(args.allow_clipboard !== undefined ? { allow_clipboard: args.allow_clipboard } : {}),
+            ...(args.allow_control !== undefined ? { allow_control: args.allow_control } : {}),
+            ...(args.side !== undefined ? { side: args.side } : {}),
+          });
+          return syncStatus();
+        case "input_save_settings": sync.input = { ...args.settings }; return syncStatus();
+        case "input_status": return syncStatus().input;
         default: return null; // plugin:event|listen etc.
       }
     },
@@ -503,26 +517,50 @@ function mockTauri(label) {
     await page.click(".history-settings >> text=Pause 15 min");
     check("recording can be paused for a while", JSON.stringify(await callsOf("pause_monitoring")) === JSON.stringify([{ minutes: 15 }]) && (await page.locator(".history-settings").textContent()).includes("Paused until"));
     // Device Sync: its own page inside Settings.
-    check("Device Sync is listed and off until enabled", /Device Sync\s*Off/.test(await page.locator(".history-settings").textContent()));
+    check("Clipet Connect is listed and off until enabled", /Clipet Connect\s*Off/.test(await page.locator(".history-settings").textContent()));
     await page.click('.history-settings button:has-text("Manage…")');
-    await page.click(".history-settings >> text=Sync clipboard history with my other devices");
+    await page.click(".history-settings >> text=Connect this computer with my other devices");
     check("turning sync on calls the backend", JSON.stringify(await callsOf("sync_set_enabled")) === JSON.stringify([{ enabled: true }]));
     await page.waitForSelector('.history-settings button:has-text("Add Device")');
     check("images are off by default", !(await page.locator('.history-settings label:has-text("Images and screenshots") input').isChecked()));
     await page.click('.history-settings button:has-text("Add Device")');
     await page.waitForSelector(".ds-invite");
-    check("Add Device shows a one-time invitation with its expiry", (await page.locator(".ds-invite").inputValue()) === "clipet-invite:abc" && (await page.locator(".history-settings").textContent()).includes("expires in"));
+    check("Add Device shows a pairing code and a one-time invitation with its expiry", (await page.locator(".ds-invite").inputValue()) === "clipet-invite:abc" && (await page.locator(".history-settings").textContent()).includes("closes in") && (await page.locator('.ds-code[aria-label="Pairing code"]').textContent()) === "482 913");
     await page.click('.history-settings button:has-text("Copy Invitation")');
     check("the invitation is copied without entering history", (await callsOf("sync_copy_invite")).length === 1 && !(await callsOf("copy_text")).length);
     await page.evaluate(() => { window.__syncPair(); window.__emit("clipet://sync-changed"); });
     await page.waitForSelector(".ds-code");
-    check("a joining device needs approval and shows the code", (await page.locator(".ds-code").textContent()) === "123 456" && (await page.locator(".history-settings").textContent()).includes("Windows PC wants to sync"));
+    check("a joining device needs approval and shows the code", (await page.locator(".ds-code").textContent()) === "123 456" && (await page.locator(".history-settings").textContent()).includes("Windows PC wants to connect"));
     await page.click('.history-settings button:has-text("Approve")');
     await page.waitForSelector(".ds-peers li");
     check("approving lists the device as online", JSON.stringify(await callsOf("sync_decide_pairing")) === JSON.stringify([{ approve: true }]) && /Windows PC.*Online/.test(await page.locator(".ds-peers").textContent()));
     await page.click('.history-settings button:has-text("OK")');
+    check("a paired device can't control this computer until allowed", !(await page.locator('.ds-peers label:has-text("Can control this computer") input').isChecked()));
+    await page.click('.ds-peers label:has-text("Can control this computer") input');
+    check("allowing control is per device", JSON.stringify((await callsOf("connect_set_device")).at(-1)) === JSON.stringify({ id: "b".repeat(64), allow_control: true }));
+    check("mouse and keyboard sharing is off by default", !(await page.locator('.history-settings label:has-text("Share mouse and keyboard") input').isChecked()));
+    await page.click('.history-settings label:has-text("Share mouse and keyboard") input');
+    await page.waitForSelector(".ds-desk");
+    check("turning sharing on shows the arrangement and the emergency shortcut", (await page.locator(".history-settings").textContent()).includes("Emergency release"));
+    await page.selectOption('.ds-arrange select', "right");
+    check("a device can be placed to the right", JSON.stringify((await callsOf("connect_set_device")).at(-1)) === JSON.stringify({ id: "b".repeat(64), side: "right" }) && (await page.locator(".ds-right").count()) === 1);
+    // Drag it above this screen.
+    const desk = await page.locator(".ds-desk").boundingBox();
+    const peer = await page.locator(".ds-right").boundingBox();
+    await page.mouse.move(peer.x + 10, peer.y + 10);
+    await page.mouse.down();
+    await page.mouse.move(desk.x + desk.width / 2, desk.y + 8, { steps: 6 });
+    await page.mouse.up();
+    check("dragging a device moves it to that side", JSON.stringify((await callsOf("connect_set_device")).at(-1)) === JSON.stringify({ id: "b".repeat(64), side: "top" }));
+    // Join a nearby device by its code.
+    await page.evaluate(() => { window.__syncNearby(); window.__emit("clipet://sync-changed"); });
+    await page.click('.history-settings button:has-text("Join a Device…")');
+    await page.click(`.ds-nearby button:has-text("Kim's MacBook")`);
+    await page.fill('input[aria-label="Pairing code"]', "482913");
+    await page.click('.ds-panel button:has-text("Join")');
+    check("a nearby device pairs by typing its code", JSON.stringify((await callsOf("sync_join_nearby")).at(-1)) === JSON.stringify({ id: "c".repeat(64), code: "482913" }));
     await page.click(".ds-peers >> text=Remove…");
-    check("removing a device asks first and says what it can't undo", (await page.locator(".history-settings").textContent()).includes("Items it already received stay on it"));
+    check("removing a device asks first and says what it can't undo", (await page.locator(".history-settings").textContent()).includes("items it already received stay on it"));
     await page.keyboard.press("Escape");
     check("Esc on the sync page goes back to Settings", (await page.locator(".history-settings").textContent()).includes("Keep history") && !(await callsOf("sync_remove_device")).length);
     await page.click(".history-settings >> text=Clear All History…");

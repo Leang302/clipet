@@ -39,6 +39,22 @@
         "shadow": true
       },
       {
+        "label": "connect",
+        "title": "Clipet Connect",
+        "width": 420,
+        "height": 56,
+        "visible": false,
+        "decorations": false,
+        "transparent": true,
+        "resizable": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "shadow": true,
+        "focus": false,
+        "focusable": false,
+        "acceptFirstMouse": true
+      },
+      {
         "label": "editor",
         "title": "Annotate — Clipet",
         "width": 1000,

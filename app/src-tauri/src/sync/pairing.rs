@@ -69,6 +69,48 @@ pub fn decode(text: &str) -> Result<Invite, String> {
     Ok(invite)
 }
 
+/// The code shown under Add Device for a nearby device to type.
+pub fn new_code() -> Result<String, String> {
+    let mut b = [0u8; 4];
+    getrandom::fill(&mut b).map_err(|e| format!("no secure random source: {e}"))?;
+    let n = u32::from_le_bytes(b) % 1_000_000;
+    Ok(format!("{:03} {:03}", n / 1000, n % 1000))
+}
+
+/// The code as typed: digits only, exactly six ("123 456", "123-456" ok).
+pub fn normalize_code(typed: &str) -> Option<String> {
+    let digits: String = typed.chars().filter(|c| !c.is_whitespace() && *c != '-').collect();
+    (digits.len() == 6 && digits.chars().all(|c| c.is_ascii_digit())).then(|| format!("{} {}", &digits[..3], &digits[3..]))
+}
+
+pub fn from_hex(s: &str) -> Option<Vec<u8>> {
+    if s.len() % 2 != 0 || s.len() > 512 {
+        return None;
+    }
+    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok()).collect()
+}
+
+type Spake = spake2::Spake2<spake2::Ed25519Group>;
+
+/// SPAKE2 bound to both device keys: the code is never sent, a wrong guess
+/// learns nothing, and a machine in the middle gets a single guess.
+pub fn spake_host(code: &str, host: &EndpointId, joiner: &EndpointId) -> (Spake, Vec<u8>) {
+    Spake::start_a(&spake2::Password::new(code.as_bytes()), &spake2::Identity::new(host.as_bytes()), &spake2::Identity::new(joiner.as_bytes()))
+}
+
+pub fn spake_joiner(code: &str, host: &EndpointId, joiner: &EndpointId) -> (Spake, Vec<u8>) {
+    Spake::start_b(&spake2::Password::new(code.as_bytes()), &spake2::Identity::new(host.as_bytes()), &spake2::Identity::new(joiner.as_bytes()))
+}
+
+/// Proof that a side derived the shared key, labelled by role.
+pub fn key_proof(key: &[u8], role: &str) -> Vec<u8> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"clipet-pair-confirm-v1");
+    hasher.update(role.as_bytes());
+    hasher.update(key);
+    hasher.finalize().to_vec()
+}
+
 /// Six digits both screens show, derived from both keys and the secret.
 pub fn verification_code(host: &EndpointId, joiner: &EndpointId, secret: &[u8; 32]) -> String {
     let mut hasher = Sha256::new();
@@ -127,6 +169,35 @@ mod tests {
         assert_eq!(code, verification_code(&h, &j, &s));
         assert_ne!(code, verification_code(&h, &x, &s));
         assert_ne!(code, verification_code(&h, &j, &new_secret().unwrap()));
+    }
+
+    #[test]
+    fn codes_are_six_digits_and_typing_is_forgiving() {
+        let code = new_code().unwrap();
+        assert_eq!(normalize_code(&code), Some(code.clone()));
+        assert_eq!(normalize_code("123456").as_deref(), Some("123 456"));
+        assert_eq!(normalize_code(" 123-456 ").as_deref(), Some("123 456"));
+        assert_eq!(normalize_code("12345"), None);
+        assert_eq!(normalize_code("12345a"), None);
+    }
+
+    #[test]
+    fn spake_agrees_only_with_the_same_code() {
+        let (h, j) = (SecretKey::generate().public(), SecretKey::generate().public());
+        let (a, ma) = spake_host("123 456", &h, &j);
+        let (b, mb) = spake_joiner("123 456", &h, &j);
+        let (ka, kb) = (a.finish(&mb).unwrap(), b.finish(&ma).unwrap());
+        assert_eq!(ka, kb);
+        let (a, ma) = spake_host("123 456", &h, &j);
+        let (b, mb) = spake_joiner("654 321", &h, &j);
+        assert_ne!(key_proof(&a.finish(&mb).unwrap(), "joiner"), key_proof(&b.finish(&ma).unwrap(), "joiner"));
+        // Bound to the device keys too.
+        let x = SecretKey::generate().public();
+        let (a, ma) = spake_host("123 456", &h, &j);
+        let (b, mb) = spake_joiner("123 456", &h, &x);
+        assert_ne!(a.finish(&mb).unwrap(), b.finish(&ma).unwrap());
+        assert_eq!(from_hex(&to_hex(&[1, 2, 255])), Some(vec![1, 2, 255]));
+        assert_eq!(from_hex("abc"), None);
     }
 
     #[test]

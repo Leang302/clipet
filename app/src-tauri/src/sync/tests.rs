@@ -10,12 +10,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-struct Dev {
-    dir: PathBuf,
+pub(crate) struct Dev {
+    pub(crate) dir: PathBuf,
     key: SecretKey,
     name: String,
     network: Network,
-    node: Arc<Node>,
+    pub(crate) node: Arc<Node>,
 }
 
 async fn start(dir: PathBuf, key: SecretKey, name: &str, images: bool, network: Network) -> Dev {
@@ -30,7 +30,7 @@ async fn start(dir: PathBuf, key: SecretKey, name: &str, images: bool, network: 
     Dev { dir, key, name: name.to_string(), network, node }
 }
 
-async fn device(name: &str, images: bool) -> Dev {
+pub(crate) async fn device(name: &str, images: bool) -> Dev {
     start(super::test_dir(name), SecretKey::generate(), name, images, Network::LocalOnly).await
 }
 
@@ -39,7 +39,7 @@ async fn restart(dev: Dev) -> Dev {
     start(dev.dir, dev.key, &dev.name, true, dev.network).await
 }
 
-async fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
+pub(crate) async fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
     for _ in 0..400 {
         if check() {
             return;
@@ -64,16 +64,20 @@ fn pairing_state(dev: &Dev) -> PairingView {
     dev.node.status().pairing
 }
 
-async fn pair(host: &Dev, joiner: &Dev) {
+pub(crate) async fn pair(host: &Dev, joiner: &Dev) {
     let invite = host.node.create_invite().await.unwrap();
     joiner.node.join(&invite).unwrap();
     wait_for("host asks for approval", || matches!(pairing_state(host), PairingView::Confirm { .. })).await;
-    wait_for("joiner shows the code", || matches!(pairing_state(joiner), PairingView::Joining { code: Some(_), .. })).await;
-    let PairingView::Confirm { name, code } = pairing_state(host) else { unreachable!() };
+    wait_for("joiner shows the code", || matches!(pairing_state(joiner), PairingView::Joining { code: Some(_), needs_confirm: true, .. })).await;
+    let PairingView::Confirm { name, code: Some(code) } = pairing_state(host) else { unreachable!() };
     let PairingView::Joining { code: Some(joiner_code), .. } = pairing_state(joiner) else { unreachable!() };
     assert_eq!(code, joiner_code, "both screens show the same code");
     assert_eq!(name, joiner.name);
+    // Approval on both devices.
     host.node.decide_pairing(true).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!matches!(pairing_state(host), PairingView::Done { .. }), "not done until the joiner confirms");
+    joiner.node.decide_pairing(true).unwrap();
     wait_for("both sides done", || {
         matches!(pairing_state(host), PairingView::Done { .. }) && matches!(pairing_state(joiner), PairingView::Done { .. })
     })
@@ -200,6 +204,7 @@ async fn an_unpaired_device_cannot_open_a_sync_connection() {
             cursor: 0,
             prefs: super::engine::Prefs::from_settings(&Default::default()),
             addr: None,
+            items: true,
         };
         super::wire::write_frame(&mut send, &request, None).await.ok()?;
         super::wire::read_frame(&mut recv).await.ok()?
@@ -220,7 +225,20 @@ async fn internet_pairing_and_sync_through_n0_services() {
     let a = start(super::test_dir("net-a"), SecretKey::generate(), "net-a", false, Network::Internet).await;
     let b = start(super::test_dir("net-b"), SecretKey::generate(), "net-b", false, Network::Internet).await;
     wait_for("relay connection", || a.node.status().relay_connected && b.node.status().relay_connected).await;
-    pair(&a, &b).await;
+    // Pair the nearby way: B finds A over mDNS while Add Device is open on A,
+    // then types A's code (SPAKE2).
+    a.node.create_invite().await.unwrap();
+    let code = hosting_code(&a);
+    let a_id = a.node.id().to_string();
+    wait_for("B sees A nearby", || b.node.status().nearby.iter().any(|d| d.id == a_id && d.name == "net-a")).await;
+    b.node.join_nearby(&a_id, &code).unwrap();
+    wait_for("A asks for approval", || matches!(pairing_state(&a), PairingView::Confirm { code: None, .. })).await;
+    a.node.decide_pairing(true).unwrap();
+    wait_for("paired", || {
+        matches!(pairing_state(&a), PairingView::Done { .. }) && matches!(pairing_state(&b), PairingView::Done { .. })
+    })
+    .await;
+    wait_for("A stops announcing", || !b.node.status().nearby.iter().any(|d| d.id == a_id)).await;
     copy_text(&a, "net-1", "over the internet");
     wait_for("A's copy reaches B", || has(&b, "net-1")).await;
     copy_text(&b, "net-2", "and back");
@@ -373,4 +391,69 @@ async fn live_app_syncs_with_another_device() {
         keyring::Entry::new("com.clipflow.app", "sync-device-key").unwrap().get_password(),
         Err(keyring::Error::NoEntry)
     ));
+}
+
+
+fn hosting_code(dev: &Dev) -> String {
+    match pairing_state(dev) {
+        PairingView::Hosting { code, .. } => code,
+        other => panic!("not hosting: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn nearby_pairing_with_the_right_code() {
+    let a = device("code-a", false).await;
+    let b = device("code-b", false).await;
+    let invite = pairing::decode(&a.node.create_invite().await.unwrap()).unwrap();
+    let code = hosting_code(&a);
+    // Typed without the space, as people do.
+    b.node.join_with_code(invite.addr, "code-a".into(), &code.replace(' ', "")).unwrap();
+    wait_for("host asks for approval", || matches!(pairing_state(&a), PairingView::Confirm { code: None, .. })).await;
+    let PairingView::Confirm { name, .. } = pairing_state(&a) else { unreachable!() };
+    assert_eq!(name, "code-b");
+    a.node.decide_pairing(true).unwrap();
+    wait_for("both done", || {
+        matches!(pairing_state(&a), PairingView::Done { .. }) && matches!(pairing_state(&b), PairingView::Done { .. })
+    })
+    .await;
+    wait_for("connected", || online(&a, &b) && online(&b, &a)).await;
+    a.node.shutdown().await;
+    b.node.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wrong_code_fails_once_and_closes_add_device() {
+    let a = device("bad-code-a", false).await;
+    let b = device("bad-code-b", false).await;
+    let invite = pairing::decode(&a.node.create_invite().await.unwrap()).unwrap();
+    let right = hosting_code(&a);
+    let wrong = if right == "000 000" { "111 111" } else { "000 000" };
+    b.node.join_with_code(invite.addr.clone(), "bad-code-a".into(), wrong).unwrap();
+    wait_for("joiner fails", || matches!(pairing_state(&b), PairingView::Failed { .. })).await;
+    wait_for("host closes Add Device", || matches!(pairing_state(&a), PairingView::Failed { .. })).await;
+    // The right code no longer works either: one guess per Add Device.
+    let c = device("bad-code-c", false).await;
+    c.node.join_with_code(invite.addr, "bad-code-a".into(), &right).unwrap();
+    wait_for("second try refused", || matches!(pairing_state(&c), PairingView::Failed { .. })).await;
+    assert!(store::list_peers(&db::open(&a.dir)).is_empty());
+    for dev in [a, b, c] {
+        dev.node.shutdown().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_joiner_who_cancels_at_the_code_trusts_nobody() {
+    let a = device("jc-a", false).await;
+    let b = device("jc-b", false).await;
+    let invite = a.node.create_invite().await.unwrap();
+    b.node.join(&invite).unwrap();
+    wait_for("joiner shows the code", || matches!(pairing_state(&b), PairingView::Joining { needs_confirm: true, .. })).await;
+    a.node.decide_pairing(true).unwrap();
+    b.node.decide_pairing(false).unwrap();
+    wait_for("host told", || matches!(pairing_state(&a), PairingView::Failed { .. })).await;
+    assert!(store::list_peers(&db::open(&a.dir)).is_empty());
+    assert!(store::list_peers(&db::open(&b.dir)).is_empty());
+    a.node.shutdown().await;
+    b.node.shutdown().await;
 }

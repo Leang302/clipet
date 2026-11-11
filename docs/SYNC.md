@@ -1,4 +1,7 @@
-# Clipet — Device Sync
+# Clipet — Clipboard history sync
+
+Part of Clipet Connect; pairing, devices and mouse / keyboard sharing are in
+`CONNECT.md`.
 
 Status: Phases 1–3 implemented; Phase 4 automated tests pass on Windows (see
 §9). **Sync between a real Windows PC and a real Mac, and across two different
@@ -128,7 +131,7 @@ else first: the name and code on A won't match B's).
 **Keys.** Each device's identity is an Ed25519 key (iroh `SecretKey`). It is
 stored in the OS credential store via `keyring`: Keychain on macOS, Credential
 Manager on Windows. If the store is unavailable, the key is kept in
-`sync_identity.key` in the app data folder and the Device Sync page says so.
+`sync_identity.key` in the app data folder and the Clipet Connect page says so.
 Trusted devices are public keys in `sync_peers`. They are not secret, but
 anyone who can write to your user profile could add one. Such a person can
 already read your clipboard history directly.
@@ -189,7 +192,7 @@ file-list items (paths mean nothing on another machine).
   stops recording.
 - Private clipboard content is never recorded, so it is never synced.
 - Text that is a Clipet pairing invitation (`clipet-invite:…`) is never sent:
-  it is a one-time credential. Copying an invitation from the Device Sync page
+  it is a one-time credential. Copying an invitation from the Clipet Connect page
   doesn't record it in history at all.
 - Logs contain item counts, sizes and short device ids. They never contain
   clipboard content or keys.
@@ -269,7 +272,7 @@ approval with the code, device listed online, remove confirmation, Esc back.
 
 ### Manual, two real devices — not done yet
 
-Before each run: install the build on both machines, open Settings → Device
+Before each run: install the build on both machines, open Settings → Clipet
 Sync, turn sync on. Allow the firewall / Local Network prompts.
 
 1. Pair: Add Device on the Mac, copy the invitation to the PC (any chat or

@@ -43,12 +43,23 @@ pub fn migrate(conn: &Connection) {
          );",
     )
     .ok();
+    // Clipet Connect: per-device grants and screen arrangement.
+    for column in [
+        "allow_clipboard INTEGER NOT NULL DEFAULT 1",
+        "allow_control INTEGER NOT NULL DEFAULT 0",
+        "side TEXT",
+    ] {
+        conn.execute(&format!("ALTER TABLE sync_peers ADD COLUMN {column}"), []).ok();
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(default)]
 pub struct SyncSettings {
+    /// Clipet Connect is on: the device network runs.
     pub enabled: bool,
+    /// Clipboard history sync (needs `enabled`); input sharing is separate.
+    pub clipboard: bool,
     pub paused: bool,
     pub sync_text: bool,
     pub sync_images: bool,
@@ -68,6 +79,7 @@ impl Default for SyncSettings {
         // Conservative: off until enabled, images opt-in.
         Self {
             enabled: false,
+            clipboard: true,
             paused: false,
             sync_text: true,
             sync_images: false,
@@ -205,6 +217,12 @@ pub struct Peer {
     /// lookup is unavailable.
     #[serde(skip)]
     pub addr: Option<String>,
+    /// Exchange clipboard history with this device.
+    pub allow_clipboard: bool,
+    /// This device may control this computer's mouse and keyboard.
+    pub allow_control: bool,
+    /// Where this device's screen sits, as seen from this computer.
+    pub side: Option<crate::input::geometry::Side>,
 }
 
 fn row_to_peer(row: &rusqlite::Row<'_>) -> rusqlite::Result<Peer> {
@@ -216,10 +234,13 @@ fn row_to_peer(row: &rusqlite::Row<'_>) -> rusqlite::Result<Peer> {
         last_seen: row.get(4)?,
         last_sync: row.get(5)?,
         addr: row.get(6)?,
+        allow_clipboard: row.get::<_, i64>(7)? != 0,
+        allow_control: row.get::<_, i64>(8)? != 0,
+        side: row.get::<_, Option<String>>(9)?.and_then(|s| serde_json::from_value(serde_json::Value::String(s)).ok()),
     })
 }
 
-const PEER_COLUMNS: &str = "id, name, added_at, cursor, last_seen, last_sync, addr";
+const PEER_COLUMNS: &str = "id, name, added_at, cursor, last_seen, last_sync, addr, allow_clipboard, allow_control, side";
 
 pub fn list_peers(conn: &Connection) -> Vec<Peer> {
     let Ok(mut stmt) = conn.prepare(&format!("SELECT {PEER_COLUMNS} FROM sync_peers ORDER BY added_at")) else {
@@ -257,6 +278,23 @@ pub fn remove_peer(conn: &Connection, id: &str) {
 
 pub fn rename_peer(conn: &Connection, id: &str, name: &str) {
     conn.execute("UPDATE sync_peers SET name = ?1 WHERE id = ?2", params![name, id]).ok();
+}
+
+pub fn set_allow_clipboard(conn: &Connection, id: &str, allow: bool) {
+    conn.execute("UPDATE sync_peers SET allow_clipboard = ?1 WHERE id = ?2", params![allow as i64, id]).ok();
+}
+
+pub fn set_allow_control(conn: &Connection, id: &str, allow: bool) {
+    conn.execute("UPDATE sync_peers SET allow_control = ?1 WHERE id = ?2", params![allow as i64, id]).ok();
+}
+
+pub fn set_side(conn: &Connection, id: &str, side: Option<crate::input::geometry::Side>) {
+    let side = side.and_then(|s| serde_json::to_value(s).ok()).and_then(|v| v.as_str().map(str::to_string));
+    if side.is_some() {
+        // One device per side.
+        conn.execute("UPDATE sync_peers SET side = NULL WHERE side = ?1 AND id != ?2", params![side, id]).ok();
+    }
+    conn.execute("UPDATE sync_peers SET side = ?1 WHERE id = ?2", params![side, id]).ok();
 }
 
 pub fn set_peer_addr(conn: &Connection, id: &str, addr: &str) {
@@ -394,6 +432,24 @@ mod tests {
         assert_eq!((peer.name.as_str(), peer.cursor, peer.addr.as_deref()), ("MacBook", 10, Some("{}")));
         remove_peer(&conn, "p");
         assert!(list_peers(&conn).is_empty());
+    }
+
+    #[test]
+    fn grants_default_to_clipboard_only_and_sides_are_exclusive() {
+        use crate::input::geometry::Side;
+        let (_dir, conn) = temp_db();
+        add_peer(&conn, "mac", "Mac", None, 1).unwrap();
+        add_peer(&conn, "pc", "PC", None, 2).unwrap();
+        let mac = &list_peers(&conn)[0];
+        assert!(mac.allow_clipboard && !mac.allow_control && mac.side.is_none());
+        set_allow_control(&conn, "mac", true);
+        set_side(&conn, "mac", Some(Side::Right));
+        set_side(&conn, "pc", Some(Side::Right));
+        let peers = list_peers(&conn);
+        assert!(peers[0].allow_control);
+        assert_eq!((peers[0].side, peers[1].side), (None, Some(Side::Right)));
+        set_side(&conn, "pc", None);
+        assert_eq!(list_peers(&conn)[1].side, None);
     }
 
     #[test]

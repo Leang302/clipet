@@ -22,6 +22,11 @@ use tokio::sync::{Notify, oneshot, watch};
 
 pub const SYNC_ALPN: &[u8] = b"clipet/sync/1";
 pub const PAIR_ALPN: &[u8] = b"clipet/pair/1";
+/// Mouse and keyboard sharing; a connection of its own so clipboard
+/// transfers never delay input.
+pub const INPUT_ALPN: &[u8] = b"clipet/input/1";
+
+pub type InputHandler = Arc<dyn Fn(EndpointId, Connection) + Send + Sync>;
 
 const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
 const HEARTBEAT: Duration = Duration::from_secs(20);
@@ -80,6 +85,9 @@ impl EndpointHooks for Gate {
                     !self.paused.load(Ordering::SeqCst) && self.trusted.read().unwrap().contains(&conn.remote_id())
                 }
                 PAIR_ALPN => self.pairing_open.load(Ordering::SeqCst),
+                // The input service checks the per-device grant itself, so
+                // it can tell the other side why control was refused.
+                INPUT_ALPN => self.trusted.read().unwrap().contains(&conn.remote_id()),
                 _ => false,
             };
         async move {
@@ -94,9 +102,13 @@ impl EndpointHooks for Gate {
 
 enum Pairing {
     Idle,
-    Hosting { secret: [u8; 32], exp: i64, invite: String },
-    HostConfirm { name: String, code: String, decide: Option<oneshot::Sender<bool>> },
-    Joining { host_name: String, code: Option<String> },
+    /// Add Device is open: an invitation and a code for nearby devices.
+    Hosting { secret: [u8; 32], code: String, exp: i64, invite: String },
+    /// A device proved the invitation or the code; this user approves it.
+    /// `code` is the verification code to compare (invitations only).
+    HostConfirm { name: String, code: Option<String>, decide: Option<oneshot::Sender<bool>> },
+    /// `confirm` is set while this user must confirm the verification code.
+    Joining { host_name: String, code: Option<String>, confirm: Option<oneshot::Sender<bool>> },
     Done { name: String },
     Failed { reason: String },
 }
@@ -106,9 +118,9 @@ enum Pairing {
 #[serde(tag = "state", rename_all = "kebab-case")]
 pub enum PairingView {
     Idle,
-    Hosting { invite: String, expires_at: i64 },
-    Confirm { name: String, code: String },
-    Joining { host_name: String, code: Option<String> },
+    Hosting { invite: String, code: String, expires_at: i64 },
+    Confirm { name: String, code: Option<String> },
+    Joining { host_name: String, code: Option<String>, needs_confirm: bool },
     Done { name: String },
     Failed { reason: String },
 }
@@ -137,6 +149,9 @@ pub struct PeerStatus {
     pub last_seen: Option<i64>,
     pub last_sync: Option<i64>,
     pub last_error: Option<String>,
+    pub allow_clipboard: bool,
+    pub allow_control: bool,
+    pub side: Option<crate::input::geometry::Side>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -147,6 +162,15 @@ pub struct NodeStatus {
     pub relay_connected: bool,
     pub peers: Vec<PeerStatus>,
     pub pairing: PairingView,
+    /// Unpaired Clipet devices on this network with Add Device open.
+    pub nearby: Vec<NearbyDevice>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct NearbyDevice {
+    pub id: String,
+    pub short_id: String,
+    pub name: String,
 }
 
 pub struct Node {
@@ -167,6 +191,10 @@ pub struct Node {
     shutdown: watch::Sender<bool>,
     /// Serializes applying received changes across sessions.
     apply_lock: Mutex<()>,
+    input_handler: Mutex<Option<InputHandler>>,
+    discovery: Option<super::discovery::Discovery>,
+    /// Devices announcing "available to pair" on this network.
+    nearby: Mutex<HashMap<EndpointId, String>>,
 }
 
 fn addr_json(addr: &EndpointAddr) -> Option<String> {
@@ -191,7 +219,12 @@ impl Node {
         let lookup = MemoryLookup::new();
         let paused = Arc::new(AtomicBool::new(paused));
         let gate = Gate { trusted: trusted.clone(), pairing_open: pairing_open.clone(), paused: paused.clone() };
-        let alpns = vec![SYNC_ALPN.to_vec(), PAIR_ALPN.to_vec()];
+        let alpns = vec![SYNC_ALPN.to_vec(), PAIR_ALPN.to_vec(), INPUT_ALPN.to_vec()];
+        // Local-network discovery (not in loopback tests).
+        let discovery = match network {
+            Network::Internet => super::discovery::Discovery::new(secret_key.public()),
+            Network::LocalOnly => None,
+        };
         let builder = match network {
             Network::Internet => Endpoint::builder(presets::N0),
             Network::LocalOnly => Endpoint::builder(presets::Minimal)
@@ -199,6 +232,10 @@ impl Node {
                 .clear_ip_transports()
                 .bind_addr(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
                 .map_err(|e| e.to_string())?,
+        };
+        let builder = match &discovery {
+            Some(d) => builder.address_lookup(d.clone()),
+            None => builder,
         };
         let endpoint = builder
             .secret_key(secret_key)
@@ -225,7 +262,25 @@ impl Node {
             observer,
             shutdown: watch::channel(false).0,
             apply_lock: Mutex::new(()),
+            input_handler: Mutex::new(None),
+            discovery,
+            nearby: Mutex::new(HashMap::new()),
         });
+        if let Some(d) = node.discovery.clone() {
+            let weak = Arc::downgrade(&node);
+            tokio::spawn(super::discovery::watch(d, move |id, name| {
+                let Some(node) = weak.upgrade() else { return };
+                let mut nearby = node.nearby.lock().unwrap();
+                let changed = match name {
+                    Some(name) => nearby.insert(id, name.clone()).as_ref() != Some(&name),
+                    None => nearby.remove(&id).is_some(),
+                };
+                drop(nearby);
+                if changed {
+                    node.changed(Change::Status);
+                }
+            }));
+        }
 
         let conn = db::open(&node.data_dir);
         for peer in store::list_peers(&conn) {
@@ -303,6 +358,9 @@ impl Node {
                         })
                     }),
                     last_error: rt.and_then(|rt| rt.last_error.clone()),
+                    allow_clipboard: p.allow_clipboard,
+                    allow_control: p.allow_control,
+                    side: p.side,
                     id: p.id,
                     name: p.name,
                     added_at: p.added_at,
@@ -314,13 +372,24 @@ impl Node {
         drop(runtime);
         let pairing = match &*self.pairing.lock().unwrap() {
             Pairing::Idle => PairingView::Idle,
-            Pairing::Hosting { exp, invite, .. } => PairingView::Hosting { invite: invite.clone(), expires_at: *exp },
+            Pairing::Hosting { exp, invite, code, .. } => PairingView::Hosting { invite: invite.clone(), code: code.clone(), expires_at: *exp },
             Pairing::HostConfirm { name, code, .. } => PairingView::Confirm { name: name.clone(), code: code.clone() },
-            Pairing::Joining { host_name, code } => PairingView::Joining { host_name: host_name.clone(), code: code.clone() },
+            Pairing::Joining { host_name, code, confirm } => {
+                PairingView::Joining { host_name: host_name.clone(), code: code.clone(), needs_confirm: confirm.is_some() }
+            }
             Pairing::Done { name } => PairingView::Done { name: name.clone() },
             Pairing::Failed { reason } => PairingView::Failed { reason: reason.clone() },
         };
+        let nearby = self
+            .nearby
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, _)| **id != self.me && !self.is_trusted(**id))
+            .map(|(id, name)| NearbyDevice { id: id.to_string(), short_id: short(id), name: name.clone() })
+            .collect();
         NodeStatus {
+            nearby,
             device_id: self.me.to_string(),
             short_id: short(&self.me),
             relay_connected: self.endpoint.addr().relay_urls().next().is_some(),
@@ -494,7 +563,7 @@ impl Node {
             .await
             .map_err(|_| "no request".to_string())?
             .map_err(|e| e.to_string())?;
-        let Some((Frame::Request { version, cursor, prefs: theirs, addr }, _)) = request else {
+        let Some((Frame::Request { version, cursor, prefs: theirs, addr, items }, _)) = request else {
             return Err("unexpected first frame".to_string());
         };
         if version != PROTOCOL_VERSION {
@@ -506,12 +575,28 @@ impl Node {
         }
         let mut changes = journal::subscribe();
         let mut pos = cursor;
+        let mut presence_only_announced = false;
         loop {
             if self.paused.load(Ordering::SeqCst) {
                 return Ok(());
             }
             if !self.is_trusted(peer) {
                 return Err("device removed".to_string());
+            }
+            // Clipboard sync off on either side: only keep the device
+            // "online" (heartbeats), and never move its cursor.
+            if !items || !self.clipboard_allowed(&db, peer) {
+                if !presence_only_announced {
+                    presence_only_announced = true;
+                    wire::write_frame(&mut send, &Frame::Heartbeat, None).await.map_err(|e| e.to_string())?;
+                }
+                tokio::select! {
+                    changed = changes.changed() => if changed.is_err() { return Ok(()) },
+                    _ = tokio::time::sleep(HEARTBEAT) => {
+                        wire::write_frame(&mut send, &Frame::Heartbeat, None).await.map_err(|e| e.to_string())?;
+                    }
+                }
+                continue;
             }
             let mine = Prefs::from_settings(&store::load_settings(&db));
             let prefs = mine.intersect(theirs);
@@ -573,12 +658,12 @@ impl Node {
     async fn pull(self: Arc<Self>, peer: EndpointId, conn: Connection) -> Result<(), String> {
         let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
         let peer_id = peer.to_string();
-        let (cursor, prefs) = {
+        let (cursor, prefs, items) = {
             let db = db::open(&self.data_dir);
-            (store::cursor(&db, &peer_id), Prefs::from_settings(&store::load_settings(&db)))
+            (store::cursor(&db, &peer_id), Prefs::from_settings(&store::load_settings(&db)), self.clipboard_allowed(&db, peer))
         };
         let addr = addr_json(&self.my_addr().await);
-        let request = Frame::Request { version: PROTOCOL_VERSION, cursor, prefs, addr };
+        let request = Frame::Request { version: PROTOCOL_VERSION, cursor, prefs, addr, items };
         wire::write_frame(&mut send, &request, None).await.map_err(|e| e.to_string())?;
         let mut established = false;
         loop {
@@ -654,6 +739,12 @@ impl Node {
         tokio::task::block_in_place(work)
     }
 
+    /// Clipboard sync with `peer` is on here: globally and for that device.
+    fn clipboard_allowed(&self, db: &rusqlite::Connection, peer: EndpointId) -> bool {
+        store::load_settings(db).clipboard
+            && store::list_peers(db).iter().any(|p| p.id == peer.to_string() && p.allow_clipboard)
+    }
+
     fn remember_addr(&self, db: &rusqlite::Connection, peer: EndpointId, addr: &str) {
         if let Ok(parsed) = serde_json::from_str::<EndpointAddr>(addr) {
             if parsed.id == peer {
@@ -690,6 +781,33 @@ impl Node {
         journal::notify();
     }
 
+    /// Closes every sync connection so they reconnect with current
+    /// settings (e.g. clipboard sync turned on or off for a device).
+    pub fn restart_sessions(&self) {
+        for rt in self.peers.lock().unwrap().values() {
+            if let Some((conn, _)) = &rt.conn {
+                conn.close(VarInt::from_u32(CLOSE_OK), b"settings changed");
+            }
+            rt.wake.notify_one();
+        }
+    }
+
+    pub fn set_input_handler(&self, handler: InputHandler) {
+        *self.input_handler.lock().unwrap() = Some(handler);
+    }
+
+    /// Opens an input connection to a trusted device.
+    pub async fn connect_input(&self, peer: EndpointId) -> Result<Connection, String> {
+        if !self.is_trusted(peer) {
+            return Err("That device isn't paired.".to_string());
+        }
+        match tokio::time::timeout(Duration::from_secs(10), self.endpoint.connect(peer, INPUT_ALPN)).await {
+            Ok(Ok(conn)) => Ok(conn),
+            Ok(Err(e)) => Err(format!("Can't reach that device ({e}).")),
+            Err(_) => Err("Can't reach that device (timed out).".to_string()),
+        }
+    }
+
     pub fn remove_peer(&self, id: &str) -> Result<(), String> {
         let peer: EndpointId = id.parse().map_err(|_| "unknown device".to_string())?;
         self.trusted.write().unwrap().remove(&peer);
@@ -707,53 +825,66 @@ impl Node {
 
     // ------------------------------------------------------------ pairing (host)
 
+    /// Opens Add Device: an invitation (any network) and a 6-digit code for a
+    /// nearby device. Either works once; the window closes after 10 minutes.
     pub async fn create_invite(&self) -> Result<String, String> {
         let secret = pairing::new_secret()?;
+        let code = pairing::new_code()?;
         let exp = now_ms() + pairing::INVITE_TTL_MS;
-        let invite = Invite {
-            v: 1,
-            addr: self.my_addr().await,
-            name: self.device_name.lock().unwrap().clone(),
-            secret: pairing::to_hex(&secret),
-            exp,
-        };
+        let name = self.device_name.lock().unwrap().clone();
+        let invite = Invite { v: 1, addr: self.my_addr().await, name: name.clone(), secret: pairing::to_hex(&secret), exp };
         let text = pairing::encode(&invite);
         self.cancel_pairing();
-        *self.pairing.lock().unwrap() = Pairing::Hosting { secret, exp, invite: text.clone() };
+        *self.pairing.lock().unwrap() = Pairing::Hosting { secret, code, exp, invite: text.clone() };
         self.pairing_open.store(true, Ordering::SeqCst);
+        if let Some(d) = &self.discovery {
+            d.set_pairing_name(Some(&name));
+        }
         self.changed(Change::Status);
         Ok(text)
     }
 
+    /// No more pairing attempts until Add Device is opened again.
+    fn close_pairing_window(&self) {
+        self.pairing_open.store(false, Ordering::SeqCst);
+        if let Some(d) = &self.discovery {
+            d.set_pairing_name(None);
+        }
+    }
+
     /// Clears an open invitation or a finished/failed pairing; declines a
-    /// pending approval.
+    /// pending approval on either side.
     pub fn cancel_pairing(&self) {
         let mut pairing = self.pairing.lock().unwrap();
-        if let Pairing::HostConfirm { decide, .. } = &mut *pairing {
-            if let Some(decide) = decide.take() {
-                let _ = decide.send(false);
+        match &mut *pairing {
+            Pairing::HostConfirm { decide, .. } | Pairing::Joining { confirm: decide, .. } => {
+                if let Some(decide) = decide.take() {
+                    let _ = decide.send(false);
+                }
             }
+            _ => {}
         }
         *pairing = Pairing::Idle;
         if let Some(task) = self.join_task.lock().unwrap().take() {
             task.abort();
         }
-        self.pairing_open.store(false, Ordering::SeqCst);
         drop(pairing);
+        self.close_pairing_window();
         self.changed(Change::Status);
     }
 
+    /// The user's answer: approving a joining device (host), or confirming
+    /// the verification code (joiner).
     pub fn decide_pairing(&self, approve: bool) -> Result<(), String> {
-        let mut pairing = self.pairing.lock().unwrap();
-        match &mut *pairing {
-            Pairing::HostConfirm { decide, .. } => {
-                if let Some(decide) = decide.take() {
-                    let _ = decide.send(approve);
-                }
-                Ok(())
-            }
-            _ => Err("There is no device waiting for approval.".to_string()),
-        }
+        let answer = match &mut *self.pairing.lock().unwrap() {
+            Pairing::HostConfirm { decide, .. } => decide.take(),
+            Pairing::Joining { confirm, .. } => confirm.take(),
+            _ => None,
+        };
+        let answer = answer.ok_or("Nothing is waiting for an answer.")?;
+        let _ = answer.send(approve);
+        self.changed(Change::Status);
+        Ok(())
     }
 
     fn set_pairing(&self, state: Pairing) {
@@ -766,7 +897,8 @@ impl Node {
         if let Pairing::Hosting { exp, .. } = &*pairing {
             if now_ms() > *exp {
                 *pairing = Pairing::Failed { reason: "The invitation expired. Create a new one.".to_string() };
-                self.pairing_open.store(false, Ordering::SeqCst);
+                drop(pairing);
+                self.close_pairing_window();
             }
         }
     }
@@ -785,6 +917,13 @@ impl Node {
                 let remote = conn.remote_id();
                 match conn.alpn() {
                     SYNC_ALPN if node.trusted.read().unwrap().contains(&remote) => node.register(remote, conn, false),
+                    INPUT_ALPN if node.is_trusted(remote) => {
+                        let handler = node.input_handler.lock().unwrap().clone();
+                        match handler {
+                            Some(handle) => handle(remote, conn),
+                            None => conn.close(VarInt::from_u32(CLOSE_OK), b"input sharing is off"),
+                        }
+                    }
                     PAIR_ALPN => node.host_pairing(conn).await,
                     _ => conn.close(VarInt::from_u32(CLOSE_REMOVED), b"not paired"),
                 }
@@ -796,7 +935,7 @@ impl Node {
         self.expire_invite_if_due();
         let result = self.clone().host_pairing_inner(&conn).await;
         if let Err(reason) = result {
-            self.pairing_open.store(false, Ordering::SeqCst);
+            self.close_pairing_window();
             let mut pairing = self.pairing.lock().unwrap();
             if !matches!(*pairing, Pairing::Done { .. }) {
                 *pairing = Pairing::Failed { reason };
@@ -815,34 +954,25 @@ impl Node {
             .await
             .map_err(|_| "The other device didn't respond.".to_string())?
             .map_err(|e| e.to_string())?;
-        let hello = read(&mut recv, DIAL_TIMEOUT).await?;
-        let Frame::PairHello { version, secret, name, addr } = hello else {
+        let Frame::PairHello { version, secret, name, addr, spake } = read(&mut recv, DIAL_TIMEOUT).await? else {
             return Err("Pairing failed: unexpected message.".to_string());
         };
-        // One attempt per invitation, whatever happens next.
-        let secret_ok = {
-            let mut pairing = self.pairing.lock().unwrap();
-            self.pairing_open.store(false, Ordering::SeqCst);
-            let ok = match &*pairing {
-                Pairing::Hosting { secret: expected, exp, .. } if now_ms() <= *exp => {
-                    pairing::from_hex32(&secret).is_some_and(|s| pairing::ct_eq(&s, expected)).then_some(*expected)
-                }
+        // One attempt per Add Device, whatever happens next.
+        let window = {
+            let pairing = self.pairing.lock().unwrap();
+            match &*pairing {
+                Pairing::Hosting { secret, code, exp, .. } if now_ms() <= *exp => Some((*secret, code.clone())),
                 _ => None,
-            };
-            if ok.is_none() {
-                *pairing = Pairing::Failed {
-                    reason: "A device tried to pair with an invalid or expired invitation. Create a new one.".to_string(),
-                };
             }
-            ok
         };
-        let Some(secret) = secret_ok else {
-            let _ = wire::write_frame(&mut send, &Frame::PairRejected { reason: "invalid or expired invitation".into() }, None).await;
-            self.changed(Change::Status);
-            return Ok(());
+        self.close_pairing_window();
+        let reject = |reason: &str| Frame::PairRejected { reason: reason.to_string() };
+        let Some((expected_secret, code)) = window else {
+            let _ = wire::write_frame(&mut send, &reject("not accepting devices right now"), None).await;
+            return Err("A device tried to pair, but Add Device wasn't open.".to_string());
         };
         if version != PROTOCOL_VERSION {
-            let _ = wire::write_frame(&mut send, &Frame::PairRejected { reason: "incompatible Clipet version".into() }, None).await;
+            let _ = wire::write_frame(&mut send, &reject("incompatible Clipet version"), None).await;
             return Err("The other device runs an incompatible Clipet version.".to_string());
         }
         if joiner == self.me {
@@ -852,22 +982,64 @@ impl Node {
             n if n.is_empty() => "Unnamed device".to_string(),
             n => n,
         };
-        let code = pairing::verification_code(&self.me, &joiner, &secret);
-        wire::write_frame(&mut send, &Frame::PairPending { code: code.clone() }, None)
-            .await
-            .map_err(|e| e.to_string())?;
-        let (decide, decision) = oneshot::channel();
-        self.set_pairing(Pairing::HostConfirm { name: name.clone(), code, decide: Some(decide) });
 
+        let shown_code = match spake {
+            // Nearby: prove both sides know the code, without sending it.
+            Some(their_msg) => {
+                let their_msg = pairing::from_hex(&their_msg).ok_or("Pairing failed: malformed message.")?;
+                let (state, my_msg) = pairing::spake_host(&code, &self.me, &joiner);
+                wire::write_frame(&mut send, &Frame::PairSpake { msg: pairing::to_hex(&my_msg) }, None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let key = state.finish(&their_msg).ok();
+                let proof_ok = match read(&mut recv, DIAL_TIMEOUT).await? {
+                    Frame::PairProof { mac } => key
+                        .as_ref()
+                        .zip(pairing::from_hex(&mac))
+                        .is_some_and(|(k, mac)| pairing::ct_eq(&mac, &pairing::key_proof(k, "joiner"))),
+                    _ => false,
+                };
+                let Some(key) = key.filter(|_| proof_ok) else {
+                    let _ = wire::write_frame(&mut send, &reject("wrong code"), None).await;
+                    return Err("A device entered a wrong pairing code. Use Add Device again to get a new code.".to_string());
+                };
+                wire::write_frame(&mut send, &Frame::PairProof { mac: pairing::to_hex(&pairing::key_proof(&key, "host")) }, None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                None
+            }
+            // Invitation: the 256-bit secret, then codes compared on both screens.
+            None => {
+                if !pairing::from_hex32(&secret).is_some_and(|s| pairing::ct_eq(&s, &expected_secret)) {
+                    let _ = wire::write_frame(&mut send, &reject("invalid or expired invitation"), None).await;
+                    return Err("A device tried to pair with an invalid or expired invitation. Create a new one.".to_string());
+                }
+                let code = pairing::verification_code(&self.me, &joiner, &expected_secret);
+                wire::write_frame(&mut send, &Frame::PairPending { code: code.clone() }, None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Some(code)
+            }
+        };
+
+        let (decide, decision) = oneshot::channel();
+        self.set_pairing(Pairing::HostConfirm { name: name.clone(), code: shown_code.clone(), decide: Some(decide) });
         let approved = tokio::select! {
             d = decision => d.unwrap_or(false),
             _ = tokio::time::sleep(APPROVAL_TIMEOUT) => false,
             _ = conn.closed() => return Err("The other device cancelled pairing.".to_string()),
         };
         if !approved {
-            let _ = wire::write_frame(&mut send, &Frame::PairRejected { reason: "declined".into() }, None).await;
+            let _ = wire::write_frame(&mut send, &reject("declined"), None).await;
             self.set_pairing(Pairing::Failed { reason: "Pairing was declined.".to_string() });
             return Ok(());
+        }
+        if shown_code.is_some() {
+            // Approval on both devices: the joiner confirms the code too.
+            match read(&mut recv, APPROVAL_TIMEOUT).await? {
+                Frame::PairConfirm => {}
+                _ => return Err(format!("{name} didn't confirm the code. Pairing stopped.")),
+            }
         }
 
         let joiner_id = joiner.to_string();
@@ -903,8 +1075,7 @@ impl Node {
 
     // ------------------------------------------------------------ pairing (joiner)
 
-    /// Starts pairing with the device that created `invite_text`; progress
-    /// is reported through the status.
+    /// Pairs using an invitation from the other device.
     pub fn join(self: &Arc<Self>, invite_text: &str) -> Result<(), String> {
         let invite = pairing::decode(invite_text)?;
         if now_ms() > invite.exp {
@@ -914,63 +1085,119 @@ impl Node {
             return Err("That invitation was created on this device.".to_string());
         }
         let host_name = clean_name(&invite.name);
-        self.set_pairing(Pairing::Joining { host_name: host_name.clone(), code: None });
+        let secret = pairing::from_hex32(&invite.secret).ok_or("This invitation is damaged.")?;
+        self.start_join(invite.addr.clone(), host_name, JoinWith::Invite { secret, addr: invite.addr });
+        Ok(())
+    }
+
+    /// Pairs with a nearby device using the code it shows.
+    pub fn join_nearby(self: &Arc<Self>, id: &str, code: &str) -> Result<(), String> {
+        let id: EndpointId = id.parse().map_err(|_| "That device is no longer nearby.".to_string())?;
+        let host_name = self.nearby.lock().unwrap().get(&id).cloned().unwrap_or_else(|| short(&id));
+        self.join_with_code(EndpointAddr::new(id), host_name, code)
+    }
+
+    pub(crate) fn join_with_code(self: &Arc<Self>, addr: EndpointAddr, host_name: String, code: &str) -> Result<(), String> {
+        let code = pairing::normalize_code(code).ok_or("Type the 6-digit code shown on the other device.")?;
+        if addr.id == self.me {
+            return Err("That's this device.".to_string());
+        }
+        self.start_join(addr, host_name, JoinWith::Code(code));
+        Ok(())
+    }
+
+    fn start_join(self: &Arc<Self>, addr: EndpointAddr, host_name: String, with: JoinWith) {
+        self.set_pairing(Pairing::Joining { host_name: host_name.clone(), code: None, confirm: None });
         let node = self.clone();
         let task = tokio::spawn(async move {
-            if let Err(reason) = node.clone().join_inner(invite, host_name).await {
+            if let Err(reason) = node.clone().join_inner(addr, host_name, with).await {
                 node.set_pairing(Pairing::Failed { reason });
             }
         });
         if let Some(old) = self.join_task.lock().unwrap().replace(task.abort_handle()) {
             old.abort();
         }
-        Ok(())
     }
 
-    async fn join_inner(self: Arc<Self>, invite: Invite, host_name: String) -> Result<(), String> {
-        let host = invite.addr.id;
-        let secret = pairing::from_hex32(&invite.secret).ok_or("This invitation is damaged.")?;
-        self.lookup.add_endpoint_info(invite.addr.clone());
-        let conn = tokio::time::timeout(DIAL_TIMEOUT, self.endpoint.connect(invite.addr.clone(), PAIR_ALPN))
+    async fn join_inner(self: Arc<Self>, addr: EndpointAddr, host_name: String, with: JoinWith) -> Result<(), String> {
+        self.lookup.add_endpoint_info(addr.clone());
+        let conn = tokio::time::timeout(DIAL_TIMEOUT, self.endpoint.connect(addr.clone(), PAIR_ALPN))
             .await
-            .map_err(|_| format!("Couldn't reach {host_name}. Make sure Clipet is running there with sync on."))?
+            .map_err(|_| format!("Couldn't reach {host_name}. Make sure Clipet is running there with Clipet Connect on."))?
             .map_err(|e| format!("Couldn't reach {host_name} ({e})."))?;
-        let result = self.join_handshake(&conn, &invite, host, &secret, &host_name).await;
+        let result = self.join_handshake(&conn, addr.id, &host_name, with).await;
         let _ = tokio::time::timeout(Duration::from_secs(3), conn.closed()).await;
         conn.close(VarInt::from_u32(CLOSE_OK), b"bye");
         result
     }
 
-    async fn join_handshake(
-        self: &Arc<Self>,
-        conn: &Connection,
-        invite: &Invite,
-        host: EndpointId,
-        secret: &[u8; 32],
-        host_name: &str,
-    ) -> Result<(), String> {
+    async fn join_handshake(self: &Arc<Self>, conn: &Connection, host: EndpointId, host_name: &str, with: JoinWith) -> Result<(), String> {
         let (mut send, mut recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
         let name = self.device_name.lock().unwrap().clone();
-        let addr = addr_json(&self.my_addr().await);
-        let hello = Frame::PairHello { version: PROTOCOL_VERSION, secret: invite.secret.clone(), name, addr };
-        wire::write_frame(&mut send, &hello, None).await.map_err(|e| e.to_string())?;
-        let expected = pairing::verification_code(&host, &self.me, secret);
-        match read(&mut recv, DIAL_TIMEOUT).await? {
-            Frame::PairPending { code } if code == expected => {}
-            Frame::PairPending { .. } => return Err("The verification codes don't match. Pairing stopped.".to_string()),
-            Frame::PairRejected { .. } => {
-                return Err(format!("{host_name} refused the invitation. It may have expired or been used already."));
+        let my_addr = addr_json(&self.my_addr().await);
+        let refused = |what: &str| format!("{host_name} refused: {what}.");
+        let stored_addr = match &with {
+            JoinWith::Invite { addr, .. } => addr_json(addr),
+            JoinWith::Code(_) => None,
+        };
+        match with {
+            JoinWith::Invite { secret, .. } => {
+                let hello = Frame::PairHello { version: PROTOCOL_VERSION, secret: pairing::to_hex(&secret), name, addr: my_addr, spake: None };
+                wire::write_frame(&mut send, &hello, None).await.map_err(|e| e.to_string())?;
+                let expected = pairing::verification_code(&host, &self.me, &secret);
+                match read(&mut recv, DIAL_TIMEOUT).await? {
+                    Frame::PairPending { code } if code == expected => {}
+                    Frame::PairPending { .. } => return Err("The verification codes don't match. Pairing stopped.".to_string()),
+                    Frame::PairRejected { reason } => return Err(refused(&reason)),
+                    _ => return Err("Pairing failed: unexpected message.".to_string()),
+                }
+                // Approval on this device too: the user confirms the code.
+                let (confirm, confirmed) = oneshot::channel();
+                self.set_pairing(Pairing::Joining { host_name: host_name.to_string(), code: Some(expected), confirm: Some(confirm) });
+                // Meanwhile the host may decline; nothing else arrives before
+                // this side confirms.
+                let ok = tokio::select! {
+                    r = confirmed => r.unwrap_or(false),
+                    frame = read(&mut recv, APPROVAL_TIMEOUT) => return Err(match frame {
+                        Ok(Frame::PairRejected { .. }) => format!("{host_name} declined pairing."),
+                        Ok(_) => "Pairing failed: unexpected message.".to_string(),
+                        Err(e) => e,
+                    }),
+                };
+                if !ok {
+                    let _ = wire::write_frame(&mut send, &Frame::PairRejected { reason: "cancelled".into() }, None).await;
+                    return Err("Pairing cancelled.".to_string());
+                }
+                wire::write_frame(&mut send, &Frame::PairConfirm, None).await.map_err(|e| e.to_string())?;
+                self.set_pairing(Pairing::Joining { host_name: host_name.to_string(), code: None, confirm: None });
             }
-            _ => return Err("Pairing failed: unexpected message.".to_string()),
+            JoinWith::Code(code) => {
+                let (state, my_msg) = pairing::spake_joiner(&code, &host, &self.me);
+                let hello = Frame::PairHello { version: PROTOCOL_VERSION, secret: String::new(), name, addr: my_addr, spake: Some(pairing::to_hex(&my_msg)) };
+                wire::write_frame(&mut send, &hello, None).await.map_err(|e| e.to_string())?;
+                let their_msg = match read(&mut recv, DIAL_TIMEOUT).await? {
+                    Frame::PairSpake { msg } => pairing::from_hex(&msg).ok_or("Pairing failed: malformed message.")?,
+                    Frame::PairRejected { reason } => return Err(refused(&reason)),
+                    _ => return Err("Pairing failed: unexpected message.".to_string()),
+                };
+                let key = state.finish(&their_msg).map_err(|_| "That code is wrong. Ask the other device for a new one.".to_string())?;
+                wire::write_frame(&mut send, &Frame::PairProof { mac: pairing::to_hex(&pairing::key_proof(&key, "joiner")) }, None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                match read(&mut recv, DIAL_TIMEOUT).await? {
+                    Frame::PairProof { mac } if pairing::from_hex(&mac).is_some_and(|m| pairing::ct_eq(&m, &pairing::key_proof(&key, "host"))) => {}
+                    Frame::PairRejected { .. } => return Err("That code is wrong. Use Add Device on the other computer again for a new code.".to_string()),
+                    _ => return Err("The other device couldn't prove it knows the code. Pairing stopped.".to_string()),
+                }
+            }
         }
-        self.set_pairing(Pairing::Joining { host_name: host_name.to_string(), code: Some(expected) });
         match read(&mut recv, APPROVAL_TIMEOUT + Duration::from_secs(10)).await? {
             Frame::PairAccepted { name } => {
                 let name = match clean_name(&name) {
                     n if n.is_empty() => host_name.to_string(),
                     n => n,
                 };
-                store::add_peer(&db::open(&self.data_dir), &host.to_string(), &name, addr_json(&invite.addr).as_deref(), now_ms())
+                store::add_peer(&db::open(&self.data_dir), &host.to_string(), &name, stored_addr.as_deref(), now_ms())
                     .map_err(|e| e.to_string())?;
                 self.trusted.write().unwrap().insert(host);
                 wire::write_frame(&mut send, &Frame::PairAck, None).await.map_err(|e| e.to_string())?;
@@ -983,6 +1210,11 @@ impl Node {
             _ => Err("Pairing failed: unexpected message.".to_string()),
         }
     }
+}
+
+enum JoinWith {
+    Invite { secret: [u8; 32], addr: EndpointAddr },
+    Code(String),
 }
 
 async fn read(recv: &mut RecvStream, limit: Duration) -> Result<Frame, String> {
